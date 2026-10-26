@@ -327,21 +327,11 @@ API_SCOPE_REQUIREMENTS = {
     # tools are named "guardian", but the platform names this API surface AIDR.
     "aidr_events_query": ["AIDR:read"],
     # Falcon Forensics operations
-    # "queryConfigurations": ["Forensics:read"],
-    # "getConfigsAndTemplates": ["Forensics:read"],
-    # "createConfiguration": ["Forensics:write"],
-    # "retireConfiguration": ["Forensics:write"],
-    # "validateConfiguration": ["Forensics:write"],
-    # "downloadConfiguration": ["Forensics:read"],
-    # "queryTemplates": ["Forensics:read"],
-    # "validateCollection": ["Forensics:write"],
+    "GetCollectionsV1": ["Forensics:read"],
+    "GetCollectorsV1": ["Forensics:read"],
     "GetCombinedCollectionsV1": ["Forensics:read"],
-    # "getCollectionCounts": ["Forensics:read"],
-    # "createCollections": ["Forensics:write"],
-    # "cancelCollections": ["Forensics:write"],
-    # "queryCollectors": ["Forensics:read"],
-    # "deployCollectors": ["Forensics:write"],
-    # "shutdownCollectors": ["Forensics:write"],
+    "GetCombinedCollectorsV1": ["Forensics:read"],
+    "GetCombinedConfigsAndTemplatesV1": ["Forensics:read"],
 }
 
 
