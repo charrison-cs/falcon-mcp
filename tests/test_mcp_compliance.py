@@ -94,6 +94,12 @@ MUTATING_TOOL_ALLOWLIST: set[str] = {
     "falcon_update_data_security_entity",
     # fusion module
     "falcon_execute_workflow",
+    # forensics module
+    "falcon_create_configuration",
+    "falcon_update_configuration",
+    "falcon_create_collection",
+    "falcon_deploy_collectors",
+    "falcon_shutdown_collectors"
 }
 
 RESOURCE_URI_PATTERN = re.compile(r"^falcon://[a-z0-9-]+(/[a-z0-9-]+)+/[a-z]+-guide$")

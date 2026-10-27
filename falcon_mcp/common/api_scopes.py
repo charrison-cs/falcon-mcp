@@ -332,6 +332,12 @@ API_SCOPE_REQUIREMENTS = {
     "GetCombinedCollectionsV1": ["Forensics:read"],
     "GetCombinedCollectorsV1": ["Forensics:read"],
     "GetCombinedConfigsAndTemplatesV1": ["Forensics:read"],
+    "PostConfigsV1": ["Forensics:write"],
+    "ValidateConfigV1": ["Forensics:write"],
+    "PostCollectionsV1": ["Forensics:write"],
+    "PostDeployV1": ["Forensics:write"],
+    "PostCollectorsV1": ["Forensics:write"],
+    "PutConfigsV1": ["Forensics:write"]
 }
 
 

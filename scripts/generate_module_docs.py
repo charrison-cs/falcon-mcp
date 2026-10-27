@@ -48,6 +48,9 @@ MODULE_METADATA: dict[str, dict[str, Any]] = {
     "datasecurity": {
         "slug": "data-security",
     },
+    "forensics": {
+        "title": "Falcon Forensics",
+    },
     "fusion": {
         "title": "Fusion SOAR",
     },

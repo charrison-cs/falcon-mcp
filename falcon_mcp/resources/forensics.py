@@ -87,7 +87,7 @@ SEARCH_COLLECTIONS_FQL_FILTERS = [
         "Number",
         "Yes",
         """
-        The priority of the collection, 0-10.
+        The priority of the collection, 1-10.
 
         Ex: priority:>'5'
         """
@@ -265,4 +265,37 @@ Falcon Query Language (FQL) - Search Forensics Configurations Guide
 • All configurations for a given platform: platform:'windows'
 • All configurations matching a name substring: name:*'*Registry*'
 
+"""
+
+CONFIGURATIONS_MODEL_GUIDE = """# Forensics Configuration Model Guide
+
+Read this before calling `create_configuration`.
+It describes the `collections` argument — the array defining WHAT a forensics
+collector gathers from a host.
+
+## clone, don't compose
+
+Do NOT write a `collections` array from scratch. The correct workflow is:
+
+1. `search_configurations_and_templates` with `filter="is_template:true"` and
+   the platform you need.
+2. `search_configurations_and_templates` (or the by-ID read) to retrieve the
+   full `collections` array of the closest-matching template.
+3. Copy that array, then add, remove, or adjust individual entries.
+4. `validate_configuration` on the result.
+5. `create_configuration` only after validation passes.
+
+Templates are the authoritative record of which collectors exist and which
+options they accept on each platform.
+
+## Shape
+
+`collections` is an array of objects, each with exactly three fields:
+
+```json
+{
+  "name": "Registry Hives",
+  "collector": "<collector-identifier>",
+  "options": { "<option-key>": "<value>" }
+}
 """

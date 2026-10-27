@@ -460,6 +460,28 @@ FILTER_HINTS: dict[str, str] = {
         "(NOT start_timestamp/end_timestamp — those are response-only names). "
         "Ex: ui_status:'Completed'+started_timestamp:>'now-7d'"
     ),
+    # === Falcon Forensics ===
+    "falcon_search_collections": (
+        "Common fields: platform (platform:'linux'), "
+        "state(pending|contacting|running|cancelled|completed|error|expired|all), collection_tag (exact: collection_tag:'FullWindowsScan'; substring: collection_tag:*'*LinuxTriage*'), "
+        "priority(1|2|3|4|5|6|7|8|9|10) "
+        "Sort uses dots (created_timestamp.asc). "
+        "Ex: state:'pending'+platform:'windows'"
+    ),
+    "falcon_search_collectors": (
+        "Common fields: platform (platform:'linux'), "
+        "state(offline|pending|inprogress|deployed|error|online|all), aid (aid:'2617e3fcf0804945ba6389328f3444f4') "
+        "Sort uses dots (seen_timestamp.asc). "
+        "Ex: state:'online'+platform:'linux'+seen_timestamp:>'now-7d'"
+    ),
+    "falcon_search_configurations_and_templates": (
+        "Common fields: platform (platform:'mac'), "
+        "name (exact: name:'WindowsRegistryScan'; substring: name:*'*LightTriage*') "
+        "description (exact: description:'MacOS Scan April 2026'; substring: description:*'*Workstations*') "
+        "Sort uses dots (name.asc) "
+        "Ex: name:'BrowserArtifacts'+platform:'macos'+description:*'*Safari*'"
+    ),
+    
 }
 
 
