@@ -235,7 +235,7 @@ class DynamicToolCatalog:
         self,
         query: str = "",
         module: str | None = None,
-        limit: int = 50,
+        limit: int = 75,
         tool_names: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Return catalog entries, with the input schema only when tools are named.
@@ -552,7 +552,7 @@ class DynamicMode:
                 le=500,
                 description="Maximum number of results to return (default: 50, max: 500). Ignored when tool_names is given.",
             ),
-        ] = 50,
+        ] = 75,
         tool_names: Annotated[
             list[str] | None,
             Field(

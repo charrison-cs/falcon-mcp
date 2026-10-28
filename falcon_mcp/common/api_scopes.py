@@ -327,8 +327,7 @@ API_SCOPE_REQUIREMENTS = {
     # tools are named "guardian", but the platform names this API surface AIDR.
     "aidr_events_query": ["AIDR:read"],
     # Falcon Forensics operations
-    "GetCollectionsV1": ["Forensics:read"],
-    "GetCollectorsV1": ["Forensics:read"],
+    "DeleteCollectionsV1": ["Forensics:write"],
     "GetCombinedCollectionsV1": ["Forensics:read"],
     "GetCombinedCollectorsV1": ["Forensics:read"],
     "GetCombinedConfigsAndTemplatesV1": ["Forensics:read"],

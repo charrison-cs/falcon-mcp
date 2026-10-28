@@ -35,24 +35,6 @@ ffcid, aid, priority, collection tag, config_id or session_id. Consult
 falcon://forensics/collectors/fql-guide before constructing filter
 expressions
 
-### `falcon_search_collections_by_ids`
-
-**Required scopes:** `Forensics:read`
-
-Search for Forensics Collectors in your CrowdStrike environment.
-
-Use this to find collections by collection IDs. Consult falcon://forensics/collectors/fql-guide before constructing filter expressions. Returns full collection details including session ID, 
-aid, ffcid, platform, state, last seen.
-
-### `falcon_search_collectors_by_ids`
-
-**Required scopes:** `Forensics:read`
-
-Search for Forensics Collections in your CrowdStrike environment.
-
-Use this to find collectors by collector IDs. Consult falcon://forensics/collectors/fql-guide before constructing filter
-expressions. Returns full collector details including, aid, ffcid, state, last seen, last modified.
-
 ### `falcon_search_configurations_and_templates`
 
 **Required scopes:** `Forensics:read`
@@ -150,6 +132,30 @@ valid hosts still run (partial success), so always inspect `errors` even on
 a successful response.
 
 Creates a new collection run only; it cannot modify an existing one.
+
+### `falcon_cancel_collections`
+
+> [!CAUTION]
+> This tool performs destructive operations.
+
+**Required scopes:** `Forensics:write`
+
+Cancel in-progress Falcon Forensics collection runs.
+
+This stops scheduled and running collections on live endpoints, so data
+those hosts had not yet uploaded is not collected. Resolve the exact
+collection IDs with `search_collections` first and confirm they are the
+intended runs before calling.
+
+Only collections in an active state are cancelled — ones already
+complete, failed, or already cancelling are left untouched. Cancelling a
+collection does not shut down or remove the collector on the host; use
+`shutdown_collectors` for that.
+
+Returns the collections that were actually cancelled. Compare that list
+against the IDs you requested: IDs that were already in a terminal state
+are reported in `not_cancelled` (partial success), so always inspect the
+response rather than assuming every requested run stopped.
 
 ### `falcon_deploy_collectors`
 

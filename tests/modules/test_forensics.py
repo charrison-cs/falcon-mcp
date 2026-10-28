@@ -3,12 +3,17 @@ Tests for the Forensics module.
 """
 
 import unittest
-from unittest.mock import patch
 
 from mcp.types import ToolAnnotations
 
 from falcon_mcp.modules.base import READ_ONLY_ANNOTATIONS
-from falcon_mcp.modules.forensics import ForensicsModule
+from falcon_mcp.modules.forensics import (
+    ForensicsModule,
+    _MAX_CANCEL_COLLECTION_IDS,
+    _MAX_COLLECTION_IDS,
+    _MAX_COLLECTION_TAG_LENGTH,
+    _MAX_DEPLOY_OR_SHUTDOWN_AIDS,
+)
 from tests.modules.utils.test_modules import TestModules
 
 _CREATE_ANNOTATIONS = ToolAnnotations(
@@ -34,10 +39,16 @@ _DESTRUCTIVE_NON_IDEMPOTENT = ToolAnnotations(
 
 _AID_A = "1234567890abcdef1234567890abcdef"
 _AID_B = "fedcba0987654321fedcba0987654321"
+_FFCID_A = "aaaabbbbccccddddaaaabbbbccccdddd"
 _CONFIG_ID = "11111111-2222-3333-4444-555555555555"
+_COLLECTION_ID_A = "99998888777766665555444433332222"
+_COLLECTION_ID_B = "11112222333344445555666677778888"
 
 _WINDOWS_COLLECTIONS = [
     {"name": "Registry Hives", "collector": "registry", "options": {"hives": ["SYSTEM"]}}
+]
+_LINUX_COLLECTIONS = [
+    {"name": "Bash History", "collector": "file", "options": {"paths": ["/root/.bash_history"]}}
 ]
 
 
@@ -57,27 +68,192 @@ def _existing_config(**overrides):
     return config
 
 
-class TestForensicsModule(TestModules):
-    """Test cases for the Forensics module."""
+def _ok(resources, errors=None, trace_id="trace-1"):
+    """A 200 StructuredResponseV1."""
+    return {
+        "status_code": 200,
+        "body": {
+            "resources": resources,
+            "errors": errors or [],
+            "meta": {"trace_id": trace_id},
+        },
+    }
+
+
+def _err(status, messages, resources=None, trace_id="trace-1"):
+    """A non-200 StructuredResponseV1."""
+    return {
+        "status_code": status,
+        "body": {
+            "resources": resources or [],
+            "errors": [{"code": status, "message": m} for m in messages],
+            "meta": {"trace_id": trace_id},
+        },
+    }
+
+
+class ForensicsTestCase(TestModules):
+    """Shared fixtures and explicit-argument call helpers.
+
+    Pydantic ``Field`` defaults do not resolve on a direct method call, so every
+    helper passes every parameter. This mirrors ``_execute`` in the Fusion tests.
+    """
 
     def setUp(self):
         """Set up test fixtures."""
         self.setup_module(ForensicsModule)
 
-    # --- Registration ---
+    # --- assertion helpers ---
+
+    def assert_is_error(self, result):
+        """Assert an error payload, tolerating a list-wrapped dict.
+
+        The base-class helpers return a bare error dict, but some callers wrap
+        it to satisfy a declared ``list[dict]`` return type, so unwrap a
+        single-element list before checking.
+        """
+        payload = result[0] if isinstance(result, list) and len(result) == 1 else result
+        self.assertIsInstance(payload, dict)
+        self.assertIn("error", payload)
+        return payload
+
+    def called_operation(self, index=0):
+        """Operation name from the nth client.command call."""
+        args, _ = self.mock_client.command.call_args_list[index]
+        return args[0]
+
+    def called_kwargs(self, index=0):
+        """Keyword arguments from the nth client.command call."""
+        _, kwargs = self.mock_client.command.call_args_list[index]
+        return kwargs
+
+    # --- call helpers ---
+
+    def search_collections(self, **overrides):
+        kwargs = {
+            "ids": None,
+            "filter": None,
+            "limit": 10,
+            "offset": None,
+            "sort": "modified_timestamp.desc",
+        }
+        kwargs.update(overrides)
+        return self.module.search_collections(**kwargs)
+
+    def search_collectors(self, **overrides):
+        kwargs = {
+            "ids": None,
+            "filter": None,
+            "limit": 10,
+            "offset": None,
+            "sort": "seen_timestamp.desc",
+        }
+        kwargs.update(overrides)
+        return self.module.search_collectors(**kwargs)
+
+    def search_configs(self, **overrides):
+        kwargs = {
+            "filter": None,
+            "limit": 10,
+            "offset": None,
+            "sort": "modified_timestamp.desc",
+        }
+        kwargs.update(overrides)
+        return self.module.search_configurations_and_templates(**kwargs)
+
+    def validate_configuration(self, **overrides):
+        kwargs = {
+            "name": "Cloned Windows Triage",
+            "platform": "windows",
+            "collections": _WINDOWS_COLLECTIONS,
+            "description": None,
+            "tag": None,
+            "is_default": None,
+            "config_id": None,
+        }
+        kwargs.update(overrides)
+        return self.module.validate_configuration(**kwargs)
+
+    def create_configuration(self, **overrides):
+        kwargs = {
+            "name": "Cloned Windows Triage",
+            "platform": "windows",
+            "collections": _WINDOWS_COLLECTIONS,
+            "description": None,
+            "tag": None,
+            "is_default": None,
+        }
+        kwargs.update(overrides)
+        return self.module.create_configuration(**kwargs)
+
+    def update_configuration(self, **overrides):
+        kwargs = {
+            "config_id": _CONFIG_ID,
+            "name": None,
+            "description": None,
+            "collections": None,
+            "platform": None,
+            "tag": None,
+            "is_default": None,
+        }
+        kwargs.update(overrides)
+        return self.module.update_configuration(**kwargs)
+
+    def create_collection(self, **overrides):
+        kwargs = {
+            "aids": [_AID_A],
+            "ffcids": None,
+            "config_id": _CONFIG_ID,
+            "platform": None,
+            "priority": 5,
+            "deadline": None,
+            "collection_tag": None,
+            "self_destruct": None,
+        }
+        kwargs.update(overrides)
+        return self.module.create_collection(**kwargs)
+
+    def cancel_collections(self, **overrides):
+        kwargs = {"ids": [_COLLECTION_ID_A]}
+        kwargs.update(overrides)
+        return self.module.cancel_collections(**kwargs)
+
+    def deploy_collectors(self, **overrides):
+        kwargs = {
+            "aids": [_AID_A],
+            "queue_offline": False,
+            "no_proxy": False,
+            "proxy_host": None,
+            "proxy_port": None,
+        }
+        kwargs.update(overrides)
+        return self.module.deploy_collectors(**kwargs)
+
+    def shutdown_collectors(self, **overrides):
+        kwargs = {
+            "aids": [_AID_A],
+            "ffcids": None,
+            "self_destruct": False,
+            "force": False,
+        }
+        kwargs.update(overrides)
+        return self.module.shutdown_collectors(**kwargs)
+
+
+class TestForensicsRegistration(ForensicsTestCase):
+    """Tool and resource registration, and annotation correctness."""
 
     def test_register_tools(self):
         """All forensics tools register under the falcon_ prefix."""
         expected_tools = [
             "falcon_search_collections",
             "falcon_search_collectors",
-            "falcon_search_collections_by_ids",
-            "falcon_search_collectors_by_ids",
             "falcon_search_configurations_and_templates",
             "falcon_validate_configuration",
             "falcon_create_configuration",
             "falcon_update_configuration",
             "falcon_create_collection",
+            "falcon_cancel_collections",
             "falcon_deploy_collectors",
             "falcon_shutdown_collectors",
         ]
@@ -104,1143 +280,1205 @@ class TestForensicsModule(TestModules):
         for name in (
             "falcon_search_collections",
             "falcon_search_collectors",
-            "falcon_search_collections_by_ids",
-            "falcon_search_collectors_by_ids",
             "falcon_search_configurations_and_templates",
             "falcon_validate_configuration",
         ):
             with self.subTest(tool=name):
                 self.assert_tool_annotations(name, READ_ONLY_ANNOTATIONS)
 
-    # def test_create_tools_are_non_destructive(self):
-    #     """Creates add new records and cannot overwrite, so destructiveHint is False."""
-    #     self.module.register_tools(self.mock_server)
-    #     self.assert_tool_annotations("falcon_create_configuration", _CREATE_ANNOTATIONS)
-    #     self.assert_tool_annotations("falcon_create_collection", _CREATE_ANNOTATIONS)
-
-    # def test_update_configuration_is_destructive_and_idempotent(self):
-    #     """Update overwrites in place with no version history.
-
-    #     idempotentHint is True because the same merged body applied twice leaves
-    #     the same stored document.
-    #     """
-    #     self.module.register_tools(self.mock_server)
-    #     self.assert_tool_annotations(
-    #         "falcon_update_configuration", _DESTRUCTIVE_IDEMPOTENT
-    #     )
-
-    # def test_deploy_is_destructive_and_not_idempotent(self):
-    #     """Deploy executes software on live endpoints; a repeat call is not a no-op."""
-    #     self.module.register_tools(self.mock_server)
-    #     self.assert_tool_annotations(
-    #         "falcon_deploy_collectors", _DESTRUCTIVE_NON_IDEMPOTENT
-    #     )
-
-    # def test_shutdown_is_destructive(self):
-    #     """Shutdown terminates in-flight collections and can uninstall collectors."""
-    #     self.module.register_tools(self.mock_server)
-    #     self.assert_tool_annotations(
-    #         "falcon_shutdown_collectors", _DESTRUCTIVE_IDEMPOTENT
-    #     )
-
-    # # --- search_collections ---
-
-    # def test_search_collections_success(self):
-    #     """Records come back inside the pagination envelope with the filter echoed."""
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 200,
-    #         "body": {
-    #             "resources": [
-    #                 {"ffcid": "f1", "aid": _AID_A, "state": "complete"},
-    #                 {"ffcid": "f2", "aid": _AID_B, "state": "in progress"},
-    #             ],
-    #             "meta": {"pagination": {"offset": 0, "limit": 10, "total": 2}},
-    #         },
-    #     }
-
-    #     result = self.module.search_collections(
-    #         ids=None,
-    #         filter="state:'complete'",
-    #         limit=10,
-    #         offset=None,
-    #         sort="last_modified_timestamp.desc",
-    #     )
-
-    #     self.assertEqual(len(result["results"]), 2)
-    #     self.assertEqual(result["filter_used"], "state:'complete'")
-    #     self.assert_pagination(result, total=2)
-
-    #     args, kwargs = self.mock_client.command.call_args
-    #     self.assertEqual(args[0], "GetCombinedCollectionsV1")
-    #     self.assertEqual(
-    #         kwargs["parameters"],
-    #         {
-    #             "filter": "state:'complete'",
-    #             "limit": 10,
-    #             "sort": "last_modified_timestamp.desc",
-    #         },
-    #     )
-
-    # def test_search_collections_drops_none_params(self):
-    #     """ids and offset are omitted from the query string when not supplied."""
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 200,
-    #         "body": {"resources": [], "meta": {"pagination": {"total": 0}}},
-    #     }
-
-    #     self.module.search_collections(
-    #         ids=None, filter=None, limit=10, offset=None, sort="priority.desc"
-    #     )
-
-    #     _, kwargs = self.mock_client.command.call_args
-    #     self.assertNotIn("ids", kwargs["parameters"])
-    #     self.assertNotIn("offset", kwargs["parameters"])
-    #     self.assertNotIn("filter", kwargs["parameters"])
-
-    # def test_search_collections_forwards_offset(self):
-    #     """offset reaches the API when supplied."""
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 200,
-    #         "body": {"resources": [], "meta": {"pagination": {"total": 0}}},
-    #     }
-
-    #     self.module.search_collections(
-    #         ids=None, filter=None, limit=25, offset=50, sort="priority.desc"
-    #     )
-
-    #     _, kwargs = self.mock_client.command.call_args
-    #     self.assertEqual(kwargs["parameters"]["offset"], 50)
-
-    # def test_search_collections_empty_returns_envelope(self):
-    #     """No matches is still an envelope, not an error."""
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 200,
-    #         "body": {
-    #             "resources": [],
-    #             "meta": {"pagination": {"offset": 0, "limit": 10, "total": 0}},
-    #         },
-    #     }
-
-    #     result = self.module.search_collections(
-    #         ids=None,
-    #         filter="state:'nope'",
-    #         limit=10,
-    #         offset=None,
-    #         sort="last_modified_timestamp.desc",
-    #     )
-
-    #     self.assertEqual(result["results"], [])
-    #     self.assert_pagination(result, total=0)
-
-    # def test_search_collections_error(self):
-    #     """A 403 surfaces as an error dict rather than an empty result set."""
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 403,
-    #         "body": {"errors": [{"code": 403, "message": "access denied"}]},
-    #     }
-
-    #     result = self.module.search_collections(
-    #         ids=None, filter=None, limit=10, offset=None, sort="priority.desc"
-    #     )
-
-    #     self.assertIn("error", result)
-
-    # # --- search_collectors ---
-
-    # def test_search_collectors_success(self):
-    #     """Collectors use their own operation and default sort."""
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 200,
-    #         "body": {
-    #             "resources": [{"ffcid": "f1", "aid": _AID_A, "state": "online"}],
-    #             "meta": {"pagination": {"offset": 0, "limit": 10, "total": 1}},
-    #         },
-    #     }
-
-    #     result = self.module.search_collectors(
-    #         ids=None,
-    #         filter="state:'online'",
-    #         limit=10,
-    #         offset=None,
-    #         sort="seen_timestamp.desc",
-    #     )
-
-    #     self.assertEqual(result["results"][0]["state"], "online")
-    #     args, kwargs = self.mock_client.command.call_args
-    #     self.assertEqual(args[0], "GetCombinedCollectorsV1")
-    #     self.assertEqual(kwargs["parameters"]["sort"], "seen_timestamp.desc")
-
-    # def test_search_collectors_error_message_names_collectors(self):
-    #     """The error text must not say 'collections' — it misroutes debugging."""
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 500,
-    #         "body": {"errors": [{"code": 500, "message": "boom"}]},
-    #     }
-
-    #     result = self.module.search_collectors(
-    #         ids=None, filter=None, limit=10, offset=None, sort="seen_timestamp.desc"
-    #     )
-
-    #     self.assertIn("error", result)
-    #     self.assertIn("collectors", result["error"].lower())
-
-    # # --- by-ID reads ---
-
-    # def test_search_collections_by_ids_success(self):
-    #     """Full records are returned unwrapped as a list."""
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 200,
-    #         "body": {"resources": [{"ffcid": "f1", "aid": _AID_A}]},
-    #     }
-
-    #     result = self.module.search_collections_by_ids(ids=["f1"])
-
-    #     self.assertEqual(result[0]["ffcid"], "f1")
-    #     args, kwargs = self.mock_client.command.call_args
-    #     self.assertEqual(args[0], "GetCollectionsV1")
-    #     self.assertEqual(kwargs["parameters"]["ids"], ["f1"])
-
-    # def test_search_collections_by_ids_empty_list_skips_api(self):
-    #     """An empty id list short-circuits without a wasted call."""
-    #     result = self.module.search_collections_by_ids(ids=[])
-
-    #     self.assertEqual(result, [])
-    #     self.mock_client.command.assert_not_called()
-
-    # def test_search_collectors_by_ids_success(self):
-    #     """Collectors by ID use the collector operation."""
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 200,
-    #         "body": {"resources": [{"ffcid": "c1", "aid": _AID_A}]},
-    #     }
-
-    #     result = self.module.search_collectors_by_ids(ids=["c1"])
-
-    #     self.assertEqual(result[0]["ffcid"], "c1")
-    #     args, _ = self.mock_client.command.call_args
-    #     self.assertEqual(args[0], "GetCollectorsV1")
-
-    # def test_search_collectors_by_ids_error_wrapped_in_list(self):
-    #     """An error is wrapped so the declared list return type holds."""
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 404,
-    #         "body": {"errors": [{"code": 404, "message": "collector 'c1' not found"}]},
-    #     }
-
-    #     result = self.module.search_collectors_by_ids(ids=["c1"])
-
-    #     self.assertIsInstance(result, list)
-    #     self.assertIn("error", result[0])
-
-    # # --- search_configurations_and_templates ---
-
-    # def test_search_configurations_success(self):
-    #     """Configurations and templates share one combined endpoint."""
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 200,
-    #         "body": {
-    #             "resources": [_existing_config(), _existing_config(is_template=True)],
-    #             "meta": {"pagination": {"offset": 0, "limit": 10, "total": 2}},
-    #         },
-    #     }
-
-    #     result = self.module.search_configurations_and_templates(
-    #         filter="platform:'windows'",
-    #         limit=10,
-    #         offset=None,
-    #         sort="last_modified_timestamp.desc",
-    #     )
-
-    #     self.assertEqual(len(result["results"]), 2)
-    #     args, _ = self.mock_client.command.call_args
-    #     self.assertEqual(args[0], "GetCombinedConfigsAndTemplatesV1")
-
-    # # --- create_configuration: client-side validation ---
-
-    # def _create(self, **overrides):
-    #     kwargs = {
-    #         "name": "Windows IR Triage",
-    #         "platform": "windows",
-    #         "collections": _WINDOWS_COLLECTIONS,
-    #         "description": None,
-    #         "tag": None,
-    #         "is_default": None,
-    #     }
-    #     kwargs.update(overrides)
-    #     return self.module.create_configuration(**kwargs)
-
-    # def test_create_rejects_empty_name_locally(self):
-    #     """A missing name is caught before the call, mirroring Validate()."""
-    #     result = self._create(name="")
-
-    #     self.assertIn("error", result)
-    #     self.assertIn("name", result["error"])
-    #     self.mock_client.command.assert_not_called()
-
-    # def test_create_rejects_overlong_name_locally(self):
-    #     """The 2000-character name bound is enforced client-side."""
-    #     result = self._create(name="x" * 2001)
-
-    #     self.assertIn("error", result)
-    #     self.mock_client.command.assert_not_called()
-
-    # def test_create_rejects_overlong_description_locally(self):
-    #     """The 4000-character description bound is enforced client-side."""
-    #     result = self._create(description="x" * 4001)
-
-    #     self.assertIn("error", result)
-    #     self.mock_client.command.assert_not_called()
-
-    # def test_create_rejects_unknown_platform_locally(self):
-    #     """PlatformUnknown is rejected before the round trip."""
-    #     result = self._create(platform="solaris")
-
-    #     self.assertIn("error", result)
-    #     self.assertIn("platform", result["error"])
-    #     self.mock_client.command.assert_not_called()
-
-    # # --- create_configuration: body construction ---
-
-    # def test_create_omits_unset_optionals(self):
-    #     """Unset optionals are pruned so the server keeps its own defaults.
-
-    #     is_default is *bool in Go: nil and false are different. Sending false
-    #     for an omitted argument would assert non-default on every create.
-    #     """
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 200,
-    #         "body": {"resources": [_existing_config()]},
-    #     }
-
-    #     self._create()
-
-    #     args, kwargs = self.mock_client.command.call_args
-    #     self.assertEqual(args[0], "PostConfigsV1")
-    #     self.assertEqual(
-    #         kwargs["body"],
-    #         {
-    #             "name": "Windows IR Triage",
-    #             "platform": "windows",
-    #             "collections": _WINDOWS_COLLECTIONS,
-    #         },
-    #     )
-
-    # def test_create_sends_no_id_key(self):
-    #     """Omitting `id` is the create signal; Go unmarshals absence to uuid.Nil."""
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 200,
-    #         "body": {"resources": [_existing_config()]},
-    #     }
-
-    #     self._create()
-
-    #     _, kwargs = self.mock_client.command.call_args
-    #     self.assertNotIn("id", kwargs["body"])
-
-    # def test_create_sends_explicit_false_is_default(self):
-    #     """An explicit False is forwarded, unlike an omitted value."""
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 200,
-    #         "body": {"resources": [_existing_config()]},
-    #     }
-
-    #     self._create(is_default=False)
-
-    #     _, kwargs = self.mock_client.command.call_args
-    #     self.assertIs(kwargs["body"]["is_default"], False)
-
-    # # --- create_configuration: response classification ---
-
-    # def test_create_success_returns_configuration(self):
-    #     """A populated 200 returns the stored configuration and the trace ID."""
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 200,
-    #         "body": {
-    #             "resources": [_existing_config()],
-    #             "meta": {"trace_id": "t-1"},
-    #         },
-    #     }
-
-    #     result = self._create()
-
-    #     self.assertEqual(result["configuration"]["id"], _CONFIG_ID)
-    #     self.assertEqual(result["trace_id"], "t-1")
-
-    # def test_create_duplicate_name_409(self):
-    #     """A 409 says the name is taken and that nothing changed."""
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 409,
-    #         "body": {
-    #             "errors": [{"code": 409, "message": "duplicate configuration name"}]
-    #         },
-    #     }
-
-    #     result = self._create()
-
-    #     self.assertIn("error", result)
-    #     self.assertIn("already exists", result["error"])
-
-    # def test_create_400_carries_collector_validation_detail(self):
-    #     """A rejected create keeps the per-collector errors, not just a failure.
-
-    #     Server-side schema validation runs on save, so the 400 already holds the
-    #     actionable detail. Collapsing it would force a redundant
-    #     validate_configuration call to recover the same information.
-    #     """
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 400,
-    #         "body": {
-    #             "errors": [
-    #                 {
-    #                     "code": 400,
-    #                     "message": "unknown collector 'regstry'",
-    #                     "type": "validation",
-    #                 }
-    #             ],
-    #             "meta": {"trace_id": "t-2"},
-    #         },
-    #     }
-
-    #     result = self._create()
-
-    #     self.assertIn("error", result)
-    #     self.assertIn("nothing was changed", result["error"])
-    #     self.assertIs(result["details"]["valid"], False)
-    #     self.assertIn("regstry", result["details"]["errors"][0]["message"])
-
-    # def test_create_empty_200_is_ambiguous_not_success(self):
-    #     """A 200 with no resource means the outcome is unknown.
-
-    #     The handler's pre-defer return on an invalid user email writes no entity,
-    #     so a bare 200 with an empty body is reachable. Reporting it as success
-    #     would claim a configuration exists when it may not.
-    #     """
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 200,
-    #         "body": {"resources": [], "errors": []},
-    #     }
-
-    #     result = self._create()
-
-    #     self.assertIn("error", result)
-    #     self.assertIn("unclear", result["error"])
-
-    # # --- validate_configuration ---
-
-    # def _validate(self, **overrides):
-    #     kwargs = {
-    #         "name": "Windows IR Triage",
-    #         "platform": "windows",
-    #         "collections": _WINDOWS_COLLECTIONS,
-    #         "description": None,
-    #         "tag": None,
-    #         "is_default": None,
-    #         "config_id": None,
-    #     }
-    #     kwargs.update(overrides)
-    #     return self.module.validate_configuration(**kwargs)
-
-    # def test_validate_valid_configuration(self):
-    #     """A clean 200 is a positive verdict, synthesised since the API sends no body."""
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 200,
-    #         "body": {"resources": [], "errors": [], "meta": {"trace_id": "t-3"}},
-    #     }
-
-    #     result = self._validate()
-
-    #     self.assertIs(result["valid"], True)
-    #     self.assertEqual(result["errors"], [])
-    #     self.assertEqual(result["validated_by"], "server")
-
-    # def test_validate_invalid_is_data_not_error(self):
-    #     """A 400 is the verdict, so it must not look like a failed tool call.
-
-    #     Routing this through the error path would discard the collector errors and
-    #     tell the caller the tool broke, when in fact the check succeeded and found
-    #     real problems.
-    #     """
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 400,
-    #         "body": {
-    #             "errors": [
-    #                 {
-    #                     "code": 400,
-    #                     "message": "collector 'registry': unknown option 'hive'",
-    #                     "type": "validation",
-    #                 }
-    #             ],
-    #             "meta": {"trace_id": "t-4"},
-    #         },
-    #     }
-
-    #     result = self._validate()
-
-    #     self.assertNotIn("error", result)
-    #     self.assertIs(result["valid"], False)
-    #     self.assertEqual(result["error_types"], ["validation"])
-    #     self.assertIn("unknown option", result["errors"][0]["message"])
-
-    # def test_validate_500_is_indeterminate_not_invalid(self):
-    #     """A validator failure must not be reported as an invalid configuration.
-
-    #     valid=False here would send the caller off rewriting collections that may
-    #     be perfectly correct.
-    #     """
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 500,
-    #         "body": {
-    #             "errors": [{"code": 500, "message": "error validating configuration"}]
-    #         },
-    #     }
-
-    #     result = self._validate()
-
-    #     self.assertIn("error", result)
-    #     self.assertNotIn("valid", result)
-    #     self.assertIn("neither accepted nor rejected", result["error"])
-
-    # def test_validate_local_failure_flags_that_server_check_was_skipped(self):
-    #     """The server short-circuits at Validate(), so collections went unchecked.
-
-    #     Without the note, a caller sees valid=False and assumes the collections
-    #     were examined.
-    #     """
-    #     result = self._validate(name="")
-
-    #     self.assertIs(result["valid"], False)
-    #     self.assertEqual(result["validated_by"], "client")
-    #     self.assertIn("did NOT run", result["note"])
-    #     self.mock_client.command.assert_not_called()
-
-    # def test_validate_forwards_config_id_as_id(self):
-    #     """Validating an edit sends the configuration's id."""
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 200,
-    #         "body": {"errors": []},
-    #     }
-
-    #     self._validate(config_id=_CONFIG_ID)
-
-    #     args, kwargs = self.mock_client.command.call_args
-    #     self.assertEqual(args[0], "ValidateConfigurationV1")
-    #     self.assertEqual(kwargs["body"]["id"], _CONFIG_ID)
-
-    # # --- update_configuration ---
-
-    # def _update(self, **overrides):
-    #     kwargs = {
-    #         "config_id": _CONFIG_ID,
-    #         "name": None,
-    #         "description": None,
-    #         "collections": None,
-    #         "platform": None,
-    #         "tag": None,
-    #         "is_default": None,
-    #     }
-    #     kwargs.update(overrides)
-    #     return self.module.update_configuration(**kwargs)
-
-    # def test_update_requires_config_id(self):
-    #     """No id means no read and no write."""
-    #     result = self._update(config_id="")
-
-    #     self.assertIn("error", result)
-    #     self.mock_client.command.assert_not_called()
-
-    # def test_update_reports_unknown_configuration(self):
-    #     """A missing configuration is named in the error, with the lookup remedy."""
-    #     with patch.object(self.module, "_base_get_by_ids", return_value=[]):
-    #         result = self._update(name="New Name")
-
-    #     self.assertIn("error", result)
-    #     self.assertIn(_CONFIG_ID, result["error"])
-    #     self.mock_client.command.assert_not_called()
-
-    # def test_update_refuses_to_mutate_a_template(self):
-    #     """Templates are the reference others clone; editing one in place is not the intent."""
-    #     with patch.object(
-    #         self.module,
-    #         "_fetch_configuration",
-    #         return_value=_existing_config(is_template=True),
-    #     ):
-    #         result = self._update(name="New Name")
-
-    #     self.assertIn("error", result)
-    #     self.assertIn("template", result["error"])
-    #     self.mock_client.command.assert_not_called()
-
-    # def test_update_preserves_omitted_fields(self):
-    #     """Omitted arguments must be refilled from the stored configuration.
-
-    #     SaveConfigRequest has no omitempty and the route is a full overwrite, so a
-    #     body missing `description` nulls the stored value. This is the test that
-    #     pins the PATCH-over-PUT behaviour.
-    #     """
-    #     with patch.object(
-    #         self.module, "_fetch_configuration", return_value=_existing_config()
-    #     ):
-    #         self.mock_client.command.return_value = {
-    #             "status_code": 200,
-    #             "body": {"resources": [_existing_config(name="Renamed")]},
-    #         }
-
-    #         self._update(name="Renamed")
-
-    #     args, kwargs = self.mock_client.command.call_args
-    #     self.assertEqual(args[0], "PutConfigsV1")
-    #     self.assertEqual(
-    #         kwargs["body"],
-    #         {
-    #             "id": _CONFIG_ID,
-    #             "name": "Renamed",
-    #             "platform": "windows",
-    #             "collections": _WINDOWS_COLLECTIONS,
-    #             "description": "original description",
-    #             "tag": "original-tag",
-    #             "is_default": True,
-    #         },
-    #     )
-
-    # def test_update_empty_string_clears_description(self):
-    #     """An empty string is a real value and must reach the API, unlike None."""
-    #     with patch.object(
-    #         self.module, "_fetch_configuration", return_value=_existing_config()
-    #     ):
-    #         self.mock_client.command.return_value = {
-    #             "status_code": 200,
-    #             "body": {"resources": [_existing_config()]},
-    #         }
-
-    #         self._update(description="")
-
-    #     _, kwargs = self.mock_client.command.call_args
-    #     self.assertEqual(kwargs["body"]["description"], "")
-
-    # def test_update_explicit_false_unsets_default(self):
-    #     """is_default=False is forwarded rather than treated as omitted."""
-    #     with patch.object(
-    #         self.module, "_fetch_configuration", return_value=_existing_config()
-    #     ):
-    #         self.mock_client.command.return_value = {
-    #             "status_code": 200,
-    #             "body": {"resources": [_existing_config()]},
-    #         }
-
-    #         self._update(is_default=False)
-
-    #     _, kwargs = self.mock_client.command.call_args
-    #     self.assertIs(kwargs["body"]["is_default"], False)
-
-    # def test_update_replaces_collections_wholesale(self):
-    #     """A supplied collections array replaces the stored one entirely."""
-    #     new_collections = [{"name": "Event Logs", "collector": "eventlog", "options": {}}]
-
-    #     with patch.object(
-    #         self.module, "_fetch_configuration", return_value=_existing_config()
-    #     ):
-    #         self.mock_client.command.return_value = {
-    #             "status_code": 200,
-    #             "body": {"resources": [_existing_config()]},
-    #         }
-
-    #         self._update(collections=new_collections)
-
-    #     _, kwargs = self.mock_client.command.call_args
-    #     self.assertEqual(kwargs["body"]["collections"], new_collections)
-
-    # def test_update_blocks_platform_change_without_collections(self):
-    #     """Switching platform while keeping old collections would carry invalid entries."""
-    #     with patch.object(
-    #         self.module, "_fetch_configuration", return_value=_existing_config()
-    #     ):
-    #         result = self._update(platform="linux")
-
-    #     self.assertIn("error", result)
-    #     self.assertIn("without also supplying", result["error"])
-    #     self.mock_client.command.assert_not_called()
-
-    # def test_update_allows_platform_change_with_collections(self):
-    #     """Supplying matching collections makes a platform change legitimate."""
-    #     linux_collections = [{"name": "Syslog", "collector": "syslog", "options": {}}]
-
-    #     with patch.object(
-    #         self.module, "_fetch_configuration", return_value=_existing_config()
-    #     ):
-    #         self.mock_client.command.return_value = {
-    #             "status_code": 200,
-    #             "body": {"resources": [_existing_config(platform="linux")]},
-    #         }
-
-    #         self._update(platform="linux", collections=linux_collections)
-
-    #     _, kwargs = self.mock_client.command.call_args
-    #     self.assertEqual(kwargs["body"]["platform"], "linux")
-    #     self.assertEqual(kwargs["body"]["collections"], linux_collections)
-
-    # def test_update_validates_merged_result(self):
-    #     """Validation runs on the merged document, not just the supplied arguments."""
-    #     with patch.object(
-    #         self.module, "_fetch_configuration", return_value=_existing_config()
-    #     ):
-    #         result = self._update(name="x" * 2001)
-
-    #     self.assertIn("error", result)
-    #     self.mock_client.command.assert_not_called()
-
-    # def test_update_duplicate_name_409(self):
-    #     """Renaming onto an existing name conflicts and changes nothing."""
-    #     with patch.object(
-    #         self.module, "_fetch_configuration", return_value=_existing_config()
-    #     ):
-    #         self.mock_client.command.return_value = {
-    #             "status_code": 409,
-    #             "body": {
-    #                 "errors": [{"code": 409, "message": "duplicate configuration name"}]
-    #             },
-    #         }
-
-    #         result = self._update(name="Taken")
-
-    #     self.assertIn("error", result)
-    #     self.assertIn("already exists", result["error"])
-
-    # def test_update_400_labels_the_operation(self):
-    #     """The failure text says 'update', so the caller knows which call failed."""
-    #     with patch.object(
-    #         self.module, "_fetch_configuration", return_value=_existing_config()
-    #     ):
-    #         self.mock_client.command.return_value = {
-    #             "status_code": 400,
-    #             "body": {"errors": [{"code": 400, "message": "bad collector"}]},
-    #         }
-
-    #         result = self._update(collections=[{"name": "x", "collector": "?", "options": {}}])
-
-    #     self.assertIn("update", result["error"])
-
-    # # --- create_collection ---
-
-    # def _create_collection(self, **overrides):
-    #     kwargs = {
-    #         "aids": [_AID_A],
-    #         "ffcids": None,
-    #         "config_id": _CONFIG_ID,
-    #         "platform": None,
-    #         "priority": 5,
-    #         "deadline": None,
-    #         "collection_tag": None,
-    #         "self_destruct": None,
-    #     }
-    #     kwargs.update(overrides)
-    #     return self.module.create_collection(**kwargs)
-
-    # def test_create_collection_requires_a_target(self):
-    #     """No aids and no ffcids is refused locally."""
-    #     result = self._create_collection(aids=None, ffcids=None)
-
-    #     self.assertIn("error", result)
-    #     self.mock_client.command.assert_not_called()
-
-    # def test_create_collection_enforces_combined_id_cap(self):
-    #     """aids and ffcids are summed against the single maximum."""
-    #     result = self._create_collection(
-    #         aids=[_AID_A] * 3000, ffcids=[_AID_B] * 2001
-    #     )
-
-    #     self.assertIn("error", result)
-    #     self.assertIn("5001", result["error"])
-    #     self.mock_client.command.assert_not_called()
-
-    # def test_create_collection_requires_platform_without_config_id(self):
-    #     """Falling back to the default configuration needs an explicit platform."""
-    #     result = self._create_collection(config_id=None, platform=None)
-
-    #     self.assertIn("error", result)
-    #     self.assertIn("platform", result["error"])
-    #     self.mock_client.command.assert_not_called()
-
-    # def test_create_collection_accepts_platform_without_config_id(self):
-    #     """platform alone is sufficient when config_id is omitted."""
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 200,
-    #         "body": {"resources": [{"ffcid": "f1"}]},
-    #     }
-
-    #     self._create_collection(config_id=None, platform="windows")
-
-    #     args, kwargs = self.mock_client.command.call_args
-    #     self.assertEqual(args[0], "PostCollectionsV1")
-    #     self.assertEqual(kwargs["body"]["platform"], "windows")
-    #     self.assertNotIn("config_id", kwargs["body"])
-
-    # def test_create_collection_rejects_overlong_tag(self):
-    #     """The collection tag length cap is enforced client-side."""
-    #     result = self._create_collection(collection_tag="t" * 101)
-
-    #     self.assertIn("error", result)
-    #     self.mock_client.command.assert_not_called()
-
-    # def test_create_collection_always_sends_both_id_lists(self):
-    #     """Both keys are present, empty rather than absent, for the unused list."""
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 200,
-    #         "body": {"resources": [{"ffcid": "f1"}]},
-    #     }
-
-    #     self._create_collection(aids=[_AID_A], ffcids=None)
-
-    #     _, kwargs = self.mock_client.command.call_args
-    #     self.assertEqual(kwargs["body"]["aids"], [_AID_A])
-    #     self.assertEqual(kwargs["body"]["ffcids"], [])
-
-    # def test_create_collection_omits_unset_optionals(self):
-    #     """deadline, collection_tag and self_destruct are pruned when unset."""
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 200,
-    #         "body": {"resources": [{"ffcid": "f1"}]},
-    #     }
-
-    #     self._create_collection()
-
-    #     _, kwargs = self.mock_client.command.call_args
-    #     for key in ("deadline", "collection_tag", "self_destruct"):
-    #         self.assertNotIn(key, kwargs["body"])
-
-    # def test_create_collection_forwards_all_optionals(self):
-    #     """Supplied scheduling options all reach the body."""
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 200,
-    #         "body": {"resources": [{"ffcid": "f1"}]},
-    #     }
-
-    #     self._create_collection(
-    #         priority=9,
-    #         deadline="2026-11-03T18:00:00Z",
-    #         collection_tag="ir-case-42",
-    #         self_destruct=True,
-    #     )
-
-    #     _, kwargs = self.mock_client.command.call_args
-    #     self.assertEqual(kwargs["body"]["priority"], 9)
-    #     self.assertEqual(kwargs["body"]["deadline"], "2026-11-03T18:00:00Z")
-    #     self.assertEqual(kwargs["body"]["collection_tag"], "ir-case-42")
-    #     self.assertIs(kwargs["body"]["self_destruct"], True)
-
-    # # --- deploy_collectors ---
-
-    # def _deploy(self, **overrides):
-    #     kwargs = {
-    #         "aids": [_AID_A],
-    #         "queue_offline": False,
-    #         "no_proxy": False,
-    #         "proxy_host": None,
-    #         "proxy_port": None,
-    #     }
-    #     kwargs.update(overrides)
-    #     return self.module.deploy_collectors(**kwargs)
-
-    # def test_deploy_requires_aids(self):
-    #     """Unlike shutdown, deploy has no tenant-wide form."""
-    #     result = self._deploy(aids=[])
-
-    #     self.assertIn("error", result)
-    #     self.mock_client.command.assert_not_called()
-
-    # def test_deploy_enforces_aid_cap(self):
-    #     """Oversized batches are rejected before the call."""
-    #     result = self._deploy(aids=[_AID_A] * 10001)
-
-    #     self.assertIn("error", result)
-    #     self.mock_client.command.assert_not_called()
-
-    # def test_deploy_rejects_no_proxy_with_proxy_host(self):
-    #     """no_proxy and a proxy host are mutually exclusive server-side."""
-    #     result = self._deploy(no_proxy=True, proxy_host="p.corp", proxy_port=8080)
-
-    #     self.assertIn("error", result)
-    #     self.mock_client.command.assert_not_called()
-
-    # def test_deploy_rejects_host_without_port(self):
-    #     """ProxyPort is seeded to -1, so a host with no port fails validation."""
-    #     result = self._deploy(proxy_host="p.corp")
-
-    #     self.assertIn("error", result)
-    #     self.mock_client.command.assert_not_called()
-
-    # def test_deploy_rejects_port_without_host(self):
-    #     """A port with no host is the 'missing host' server error, caught locally."""
-    #     result = self._deploy(proxy_port=8080)
-
-    #     self.assertIn("error", result)
-    #     self.mock_client.command.assert_not_called()
-
-    # def test_deploy_omits_proxy_keys_when_unset(self):
-    #     """No proxy key may be sent when none was requested.
-
-    #     The handler seeds ProxyPort to -1 as its 'unspecified' sentinel. Sending
-    #     proxy_port=0 instead would trip the no_proxy conflict check, so a default
-    #     of 0 would make no_proxy unusable.
-    #     """
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 200,
-    #         "body": {"resources": [{"aid": _AID_A}]},
-    #     }
-
-    #     self._deploy()
-
-    #     args, kwargs = self.mock_client.command.call_args
-    #     self.assertEqual(args[0], "PostDeployV1")
-    #     self.assertEqual(kwargs["body"], {"aids": [_AID_A], "queue_offline": False})
-
-    # def test_deploy_sends_no_proxy_alone(self):
-    #     """no_proxy travels without any host or port key."""
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 200,
-    #         "body": {"resources": [{"aid": _AID_A}]},
-    #     }
-
-    #     self._deploy(no_proxy=True)
-
-    #     _, kwargs = self.mock_client.command.call_args
-    #     self.assertIs(kwargs["body"]["no_proxy"], True)
-    #     self.assertNotIn("proxy_host", kwargs["body"])
-    #     self.assertNotIn("proxy_port", kwargs["body"])
-
-    # def test_deploy_sends_proxy_pair(self):
-    #     """A valid host and port pair is forwarded together."""
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 200,
-    #         "body": {"resources": [{"aid": _AID_A}]},
-    #     }
-
-    #     self._deploy(proxy_host="p.corp", proxy_port=8080)
-
-    #     _, kwargs = self.mock_client.command.call_args
-    #     self.assertEqual(kwargs["body"]["proxy_host"], "p.corp")
-    #     self.assertEqual(kwargs["body"]["proxy_port"], 8080)
-
-    # def test_deploy_strips_whitespace_from_aids(self):
-    #     """Padded AIDs would be unmarshalled as invalid UUIDs."""
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 200,
-    #         "body": {"resources": [{"aid": _AID_A}]},
-    #     }
-
-    #     self._deploy(aids=[f"  {_AID_A}  "])
-
-    #     _, kwargs = self.mock_client.command.call_args
-    #     self.assertEqual(kwargs["body"]["aids"], [_AID_A])
-
-    # def test_deploy_full_success(self):
-    #     """Every requested host deployed, so no warning is attached."""
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 200,
-    #         "body": {
-    #             "resources": [{"aid": _AID_A}, {"aid": _AID_B}],
-    #             "meta": {"trace_id": "t-5"},
-    #         },
-    #     }
-
-    #     result = self._deploy(aids=[_AID_A, _AID_B])
-
-    #     self.assertEqual(result["deployed_count"], 2)
-    #     self.assertEqual(result["requested_count"], 2)
-    #     self.assertNotIn("warning", result)
-
-    # def test_deploy_partial_success_names_missing_hosts(self):
-    #     """A 200 can cover fewer hosts than requested, with no entry in `errors`.
-
-    #     Resources hold only what the service returned, so without this diff the
-    #     caller would report success for hosts that were never touched.
-    #     """
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 200,
-    #         "body": {"resources": [{"aid": _AID_A}], "meta": {"trace_id": "t-6"}},
-    #     }
-
-    #     result = self._deploy(aids=[_AID_A, _AID_B])
-
-    #     self.assertEqual(result["deployed_count"], 1)
-    #     self.assertEqual(result["not_deployed"], [_AID_B])
-    #     self.assertIn("warning", result)
-
-    # def test_deploy_matches_aids_case_insensitively(self):
-    #     """AID casing must not produce a false partial-failure report."""
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 200,
-    #         "body": {"resources": [{"aid": _AID_A.upper()}]},
-    #     }
-
-    #     result = self._deploy(aids=[_AID_A])
-
-    #     self.assertEqual(result["deployed_count"], 1)
-    #     self.assertNotIn("not_deployed", result)
-
-    # def test_deploy_failure_states_nothing_deployed(self):
-    #     """A 400 with no resources must say explicitly that nothing happened."""
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 400,
-    #         "body": {
-    #             "errors": [{"code": 400, "message": "no valid aids"}],
-    #             "resources": [],
-    #         },
-    #     }
-
-    #     result = self._deploy()
-
-    #     self.assertIn("error", result)
-    #     self.assertIn("No collectors were deployed", result["error"])
-
-    # # --- shutdown_collectors ---
-
-    # def _shutdown(self, **overrides):
-    #     kwargs = {
-    #         "aids": [_AID_A],
-    #         "ffcids": None,
-    #         "platform": None,
-    #         "self_destruct": False,
-    #         "force": False,
-    #     }
-    #     kwargs.update(overrides)
-    #     return self.module.shutdown_collectors(**kwargs)
-
-    # def test_shutdown_refuses_empty_target_list(self):
-    #     """An empty request is a tenant-wide shutdown and must be refused.
-
-    #     The server's own len(AIDs)+len(FfcAIDs)==0 guard is commented out, so an
-    #     argument-free call terminates every collector in the CID — the single
-    #     easiest call for a caller to emit by accident.
-    #     """
-    #     result = self._shutdown(aids=None, ffcids=None)
-
-    #     self.assertIn("error", result)
-    #     self.mock_client.command.assert_not_called()
-
-    # def test_shutdown_enforces_combined_cap(self):
-    #     """aids and ffcids are summed against one maximum."""
-    #     result = self._shutdown(aids=[_AID_A] * 6000, ffcids=[_AID_B] * 4001)
-
-    #     self.assertIn("error", result)
-    #     self.mock_client.command.assert_not_called()
-
-    # def test_shutdown_sends_both_id_lists_and_flags(self):
-    #     """self_destruct and force have no omitempty, so they are always sent."""
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 200,
-    #         "body": {"resources": [{"aid": _AID_A, "ffcid": "f1"}]},
-    #     }
-
-    #     self._shutdown()
-
-    #     args, kwargs = self.mock_client.command.call_args
-    #     self.assertEqual(args[0], "ShutdownCollectorsV1")
-    #     self.assertEqual(
-    #         kwargs["body"],
-    #         {
-    #             "aids": [_AID_A],
-    #             "ffcids": [],
-    #             "self_destruct": False,
-    #             "force": False,
-    #         },
-    #     )
-
-    # def test_shutdown_omits_platform_when_unset(self):
-    #     """Platform is seeded to PlatformUnknown, so the key is left out."""
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 200,
-    #         "body": {"resources": []},
-    #     }
-
-    #     self._shutdown()
-
-    #     _, kwargs = self.mock_client.command.call_args
-    #     self.assertNotIn("platform", kwargs["body"])
-
-    # def test_shutdown_forwards_platform_and_flags(self):
-    #     """Explicit platform, self_destruct and force all reach the body."""
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 200,
-    #         "body": {"resources": [{"aid": _AID_A}]},
-    #     }
-
-    #     self._shutdown(platform="windows", self_destruct=True, force=True)
-
-    #     _, kwargs = self.mock_client.command.call_args
-    #     self.assertEqual(kwargs["body"]["platform"], "windows")
-    #     self.assertIs(kwargs["body"]["self_destruct"], True)
-    #     self.assertIs(kwargs["body"]["force"], True)
-
-    # def test_shutdown_success_echoes_self_destruct(self):
-    #     """The result records whether collectors were uninstalled, not just stopped."""
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 200,
-    #         "body": {
-    #             "resources": [{"aid": _AID_A, "ffcid": "f1"}],
-    #             "meta": {"trace_id": "t-7"},
-    #         },
-    #     }
-
-    #     result = self._shutdown(self_destruct=True)
-
-    #     self.assertEqual(result["shutdown_count"], 1)
-    #     self.assertIs(result["self_destruct"], True)
-
-    # def test_shutdown_matches_targets_on_aid_or_ffcid(self):
-    #     """Targets may be given as either identifier, so both are checked."""
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 200,
-    #         "body": {"resources": [{"aid": _AID_A, "ffcid": "f1"}]},
-    #     }
-
-    #     result = self._shutdown(aids=[_AID_A], ffcids=["f1"])
-
-    #     self.assertNotIn("not_shutdown", result)
-
-    # def test_shutdown_partial_names_unmatched_targets(self):
-    #     """Requested targets with no returned collector are reported back."""
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 200,
-    #         "body": {"resources": [{"aid": _AID_A, "ffcid": "f1"}]},
-    #     }
-
-    #     result = self._shutdown(aids=[_AID_A, _AID_B])
-
-    #     self.assertEqual(result["not_shutdown"], [_AID_B])
-    #     self.assertIn("warning", result)
-
-    # def test_shutdown_404_is_benign_and_discourages_force_retry(self):
-    #     """Nothing running is not a failure, and force is the wrong response.
-
-    #     ErrNoInProgressCollector means no state changed. Surfacing it as an error
-    #     invites a retry with force=true, which risks abandoning a collection
-    #     elsewhere while fixing nothing here.
-    #     """
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 404,
-    #         "body": {
-    #             "errors": [{"code": 404, "message": "no in progress collector"}],
-    #             "meta": {"trace_id": "t-8"},
-    #         },
-    #     }
-
-    #     result = self._shutdown()
-
-    #     self.assertNotIn("error", result)
-    #     self.assertIs(result["no_collectors_in_progress"], True)
-    #     self.assertEqual(result["shutdown_count"], 0)
-    #     self.assertIn("force=true", result["message"])
-
-    # def test_shutdown_500_is_an_error(self):
-    #     """An internal failure stays an error, unlike the 404 case."""
-    #     self.mock_client.command.return_value = {
-    #         "status_code": 500,
-    #         "body": {"errors": [{"code": 500, "message": "internal"}], "resources": []},
-    #     }
-
-    #     result = self._shutdown()
-
-    #     self.assertIn("error", result)
+    def test_mutating_tools_declare_their_blast_radius(self):
+        """Each write tool carries annotations matching what it actually does.
+
+        These hints drive client-side confirmation prompts, so a tool that
+        touches live endpoints must not advertise itself as safe. Creates are
+        non-destructive but non-idempotent (a second call starts a second run);
+        cancel and shutdown are destructive and idempotent (repeating finds
+        nothing left to stop); deploy is destructive and non-idempotent.
+        """
+        self.module.register_tools(self.mock_server)
+        expected = {
+            "falcon_create_configuration": _CREATE_ANNOTATIONS,
+            "falcon_create_collection": _CREATE_ANNOTATIONS,
+            "falcon_update_configuration": _DESTRUCTIVE_IDEMPOTENT,
+            "falcon_cancel_collections": _DESTRUCTIVE_IDEMPOTENT,
+            "falcon_shutdown_collectors": _DESTRUCTIVE_IDEMPOTENT,
+            "falcon_deploy_collectors": _DESTRUCTIVE_NON_IDEMPOTENT,
+        }
+        for name, annotations in expected.items():
+            with self.subTest(tool=name):
+                self.assert_tool_annotations(name, annotations)
+
+
+class TestSearchCollections(ForensicsTestCase):
+    """search_collections."""
+
+    def test_success_returns_pagination_envelope(self):
+        """Full records come back inside the envelope with filter_used echoed."""
+        self.mock_client.command.return_value = {
+            "status_code": 200,
+            "body": {
+                "resources": [
+                    {"id": _COLLECTION_ID_A, "state": "complete", "platform": "windows"},
+                    {"id": _COLLECTION_ID_B, "state": "in progress", "platform": "windows"},
+                ],
+                "meta": {"pagination": {"offset": 0, "limit": 10, "total": 2}},
+            },
+        }
+
+        result = self.search_collections(filter="platform:'windows'")
+
+        self.assertEqual(len(result["results"]), 2)
+        self.assertEqual(result["results"][0]["id"], _COLLECTION_ID_A)
+        self.assertEqual(result["filter_used"], "platform:'windows'")
+        self.assert_pagination(result, total=2)
+
+        # One call: the combined endpoint returns full records, so there is no
+        # hydrate-by-ID second step.
+        self.mock_client.command.assert_called_once()
+        self.assertEqual(self.called_operation(), "GetCombinedCollectionsV1")
+        self.assertEqual(
+            self.called_kwargs()["parameters"],
+            {
+                "filter": "platform:'windows'",
+                "limit": 10,
+                "sort": "modified_timestamp.desc",
+            },
+        )
+
+    def test_forwards_ids_and_offset(self):
+        """ids and offset reach the API when supplied.
+
+        `ids` is this tool's only route to a specific collection now that the
+        dedicated by-ID tools are gone, so it must not be dropped.
+        """
+        self.mock_client.command.return_value = {
+            "status_code": 200,
+            "body": {"resources": [], "meta": {"pagination": {"total": 0}}},
+        }
+
+        self.search_collections(
+            ids=[_COLLECTION_ID_A], offset=50, limit=25, sort="priority.desc"
+        )
+
+        self.assertEqual(
+            self.called_kwargs()["parameters"],
+            {
+                "ids": [_COLLECTION_ID_A],
+                "limit": 25,
+                "offset": 50,
+                "sort": "priority.desc",
+            },
+        )
+
+    def test_empty_result_still_returns_envelope(self):
+        """No matches is a successful search, not an error."""
+        self.mock_client.command.return_value = {
+            "status_code": 200,
+            "body": {
+                "resources": [],
+                "meta": {"pagination": {"offset": 0, "limit": 10, "total": 0}},
+            },
+        }
+
+        result = self.search_collections(filter="state:'complete'")
+
+        self.assertEqual(result["results"], [])
+        self.assertNotIn("error", result)
+        self.assert_pagination(result, total=0)
+
+    def test_bad_filter_surfaces_api_message(self):
+        """A 400 keeps the API's field-level message so a retry can be correct."""
+        self.mock_client.command.return_value = _err(
+            400, ["Invalid FQL: fql: bogus is an unknown property"]
+        )
+
+        result = self.search_collections(filter="bogus:'x'")
+
+        self.assertIn("error", result)
+        self.assertIn("unknown property", result["error"])
+
+    def test_scope_error_surfaces_details(self):
+        """A 403 surfaces as an error with details, not an empty envelope."""
+        self.mock_client.command.return_value = _err(
+            403, ["access denied, authorization failed"]
+        )
+
+        result = self.search_collections()
+
+        self.assertIn("error", result)
+        self.assertIn("details", result)
+        self.assertNotIn("results", result)
+
+
+class TestSearchCollectors(ForensicsTestCase):
+    """search_collectors."""
+
+    def test_success_returns_pagination_envelope(self):
+        """Collector records come back inside the envelope."""
+        self.mock_client.command.return_value = {
+            "status_code": 200,
+            "body": {
+                "resources": [{"ffcid": _FFCID_A, "aid": _AID_A, "state": "online"}],
+                "meta": {"pagination": {"offset": 0, "limit": 10, "total": 1}},
+            },
+        }
+
+        result = self.search_collectors(filter="state:'online'")
+
+        self.assertEqual(result["results"][0]["ffcid"], _FFCID_A)
+        self.assertEqual(result["filter_used"], "state:'online'")
+        self.assert_pagination(result, total=1)
+        self.assertEqual(self.called_operation(), "GetCombinedCollectorsV1")
+        self.assertEqual(
+            self.called_kwargs()["parameters"],
+            {"filter": "state:'online'", "limit": 10, "sort": "seen_timestamp.desc"},
+        )
+
+    def test_forwards_ids_and_offset(self):
+        """ids and offset reach the API when supplied."""
+        self.mock_client.command.return_value = {
+            "status_code": 200,
+            "body": {"resources": [], "meta": {"pagination": {"total": 0}}},
+        }
+
+        self.search_collectors(ids=[_FFCID_A], offset=20, limit=50, sort="platform.asc")
+
+        self.assertEqual(
+            self.called_kwargs()["parameters"],
+            {
+                "ids": [_FFCID_A],
+                "limit": 50,
+                "offset": 20,
+                "sort": "platform.asc",
+            },
+        )
+
+    def test_error_surfaces_api_message(self):
+        """A 500 surfaces as an error dict, not an envelope."""
+        self.mock_client.command.return_value = _err(500, ["Internal Server Error"])
+
+        result = self.search_collectors()
+
+        self.assertIn("error", result)
+        self.assertNotIn("results", result)
+
+
+class TestSearchConfigurations(ForensicsTestCase):
+    """search_configurations_and_templates."""
+
+    def test_success_returns_templates_and_configs(self):
+        """Templates and configurations share one envelope, flagged by is_template."""
+        self.mock_client.command.return_value = {
+            "status_code": 200,
+            "body": {
+                "resources": [
+                    {"id": "t1", "name": "Windows Template", "is_template": True},
+                    {"id": _CONFIG_ID, "name": "Windows IR Triage", "is_template": False},
+                ],
+                "meta": {"pagination": {"offset": 0, "limit": 10, "total": 2}},
+            },
+        }
+
+        result = self.search_configs(filter="platform:'windows'")
+
+        self.assertTrue(result["results"][0]["is_template"])
+        self.assertEqual(result["filter_used"], "platform:'windows'")
+        self.assert_pagination(result, total=2)
+        self.assertEqual(self.called_operation(), "GetCombinedConfigsAndTemplatesV1")
+        self.assertEqual(
+            self.called_kwargs()["parameters"],
+            {
+                "filter": "platform:'windows'",
+                "limit": 10,
+                "sort": "modified_timestamp.desc",
+            },
+        )
+
+    def test_forwards_offset(self):
+        """offset reaches the API when supplied."""
+        self.mock_client.command.return_value = {
+            "status_code": 200,
+            "body": {"resources": [], "meta": {"pagination": {"total": 0}}},
+        }
+
+        self.search_configs(offset=30, limit=25, sort="name.asc")
+
+        self.assertEqual(
+            self.called_kwargs()["parameters"],
+            {"limit": 25, "offset": 30, "sort": "name.asc"},
+        )
+
+    def test_error_surfaces_api_message(self):
+        """A 400 surfaces as an error dict."""
+        self.mock_client.command.return_value = _err(400, ["invalid sort 'bogus'"])
+
+        result = self.search_configs(sort="bogus.desc")
+
+        self.assertIn("error", result)
+        self.assertIn("invalid sort", result["error"])
+
+
+class TestValidateConfiguration(ForensicsTestCase):
+    """validate_configuration and the verdict classifier."""
+
+    def test_valid_configuration(self):
+        """A clean 200 is an explicit positive verdict, attributed to the server."""
+        self.mock_client.command.return_value = _ok([], trace_id="tr-valid")
+
+        result = self.validate_configuration()
+
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["validated_by"], "server")
+        self.assertEqual(result["trace_id"], "tr-valid")
+        self.assertEqual(self.called_operation(), "ValidateConfigV1")
+
+    def test_invalid_configuration_preserves_collector_errors(self):
+        """A 400 is a verdict, not a tool failure, and errors pass through verbatim.
+
+        The error objects carry the offending collector name and field path,
+        which is the only actionable detail a caller has for fixing the
+        untyped `options` payload, so they must not be reformatted.
+        """
+        self.mock_client.command.return_value = {
+            "status_code": 400,
+            "body": {
+                "errors": [
+                    {
+                        "code": 400,
+                        "type": "validation",
+                        "message": "collector 'registry': unknown option 'hive'",
+                    },
+                    {"code": 400, "type": "platform", "message": "not valid on windows"},
+                ],
+                "meta": {"trace_id": "tr-invalid"},
+            },
+        }
+
+        result = self.validate_configuration()
+
+        self.assertFalse(result["valid"])
+        self.assertNotIn("error", result)
+        self.assertEqual(len(result["errors"]), 2)
+        self.assertIn("unknown option 'hive'", result["errors"][0]["message"])
+        self.assertEqual(result["error_types"], ["platform", "validation"])
+        self.assertEqual(result["validated_by"], "server")
+
+    def test_invalid_configuration_tolerates_untyped_errors(self):
+        """Errors with no `type` are kept but contribute no error_types entry."""
+        self.mock_client.command.return_value = {
+            "status_code": 400,
+            "body": {"errors": [{"code": 400, "message": "bad collections"}], "meta": {}},
+        }
+
+        result = self.validate_configuration()
+
+        self.assertFalse(result["valid"])
+        self.assertEqual(result["error_types"], [])
+
+    def test_validator_failure_is_not_a_negative_verdict(self):
+        """A 500 means no verdict was produced; reporting invalid would mislead.
+
+        The validator itself failing says nothing about the configuration, and a
+        false `valid: false` would send the caller off rewriting collections
+        that may be correct.
+        """
+        self.mock_client.command.return_value = _err(500, ["validation failed"])
+
+        result = self.validate_configuration()
+
+        self.assertIn("error", result)
+        self.assertNotIn("valid", result)
+        self.assertIn("neither accepted nor rejected", result["error"])
+
+    def test_local_rejection_reports_that_server_check_did_not_run(self):
+        """A locally-rejected request must not look like a collector verdict.
+
+        Returning a bare `valid: false` here would imply the collections were
+        examined, so the response is attributed to the client and says the
+        server check was skipped.
+        """
+        result = self.validate_configuration(name="")
+
+        self.assertFalse(result["valid"])
+        self.assertEqual(result["validated_by"], "client")
+        self.assertEqual(result["error_types"], ["request"])
+        self.assertIn("did NOT run", result["note"])
+        self.mock_client.command.assert_not_called()
+
+    def test_local_rejection_on_oversized_name(self):
+        """A name over the limit is caught locally."""
+        result = self.validate_configuration(name="x" * 2001)
+
+        self.assertFalse(result["valid"])
+        self.mock_client.command.assert_not_called()
+
+    def test_local_rejection_on_oversized_description(self):
+        """A description over the limit is caught locally."""
+        result = self.validate_configuration(description="d" * 4001)
+
+        self.assertFalse(result["valid"])
+        self.mock_client.command.assert_not_called()
+
+    def test_local_rejection_on_unknown_platform(self):
+        """An unsupported platform is caught locally."""
+        result = self.validate_configuration(platform="solaris")
+
+        self.assertFalse(result["valid"])
+        self.mock_client.command.assert_not_called()
+
+    def test_body_omits_unset_optionals_and_maps_config_id_to_id(self):
+        """Only supplied fields are sent, and config_id travels as `id`."""
+        self.mock_client.command.return_value = _ok([])
+
+        self.validate_configuration(
+            description="desc", tag="ir", is_default=True, config_id=_CONFIG_ID
+        )
+
+        self.assertEqual(
+            self.called_kwargs()["body"],
+            {
+                "name": "Cloned Windows Triage",
+                "platform": "windows",
+                "collections": _WINDOWS_COLLECTIONS,
+                "id": _CONFIG_ID,
+                "description": "desc",
+                "tag": "ir",
+                "is_default": True,
+            },
+        )
+
+    def test_body_for_new_configuration_has_no_id(self):
+        """Validating a new configuration must not send an `id`."""
+        self.mock_client.command.return_value = _ok([])
+
+        self.validate_configuration()
+
+        self.assertNotIn("id", self.called_kwargs()["body"])
+
+
+class TestCreateConfiguration(ForensicsTestCase):
+    """create_configuration."""
+
+    def test_success_calls_the_create_operation(self):
+        """The create path must persist, not merely validate.
+
+        This previously called ValidateConfigV1 — the same operation as
+        validate_configuration — so a tool annotated as a write reported a
+        created configuration while storing nothing. Pinning the operation
+        keeps the two paths from collapsing back together.
+        """
+        self.mock_client.command.return_value = _ok([_existing_config()])
+
+        self.create_configuration()
+
+        self.assertEqual(self.called_operation(), "PostConfigsV1")
+
+    def test_success_returns_the_stored_configuration(self):
+        """The created record is returned under `configuration` with its trace id."""
+        stored = _existing_config(name="Cloned Windows Triage")
+        self.mock_client.command.return_value = _ok([stored], trace_id="tr-create")
+
+        result = self.create_configuration()
+
+        self.assertEqual(result["configuration"]["id"], _CONFIG_ID)
+        self.assertEqual(result["trace_id"], "tr-create")
+
+    def test_local_validation_blocks_the_write(self):
+        """A bad request is rejected before any write is attempted."""
+        result = self.create_configuration(name="")
+
+        self.assertIn("error", result)
+        self.mock_client.command.assert_not_called()
+
+    def test_duplicate_name_is_reported_as_no_change(self):
+        """A 409 must state that nothing changed, so no cleanup is attempted."""
+        self.mock_client.command.return_value = _err(409, ["name already exists"])
+
+        result = self.create_configuration()
+
+        self.assertIn("error", result)
+        self.assertIn("already exists", result["error"])
+        self.assertIn("Nothing was changed", result["error"])
+
+    def test_validation_rejection_nests_the_collector_errors(self):
+        """A 400 keeps the per-collector detail needed to fix the collections."""
+        self.mock_client.command.return_value = {
+            "status_code": 400,
+            "body": {
+                "errors": [
+                    {
+                        "code": 400,
+                        "type": "validation",
+                        "message": "collector 'registry': unknown option 'hive'",
+                    }
+                ],
+                "meta": {"trace_id": "tr-400"},
+            },
+        }
+
+        result = self.create_configuration()
+
+        self.assertIn("error", result)
+        self.assertIn("rejected by validation", result["error"])
+        self.assertFalse(result["details"]["valid"])
+        self.assertIn("unknown option 'hive'", result["details"]["errors"][0]["message"])
+
+    def test_success_without_a_resource_is_treated_as_uncertain(self):
+        """A 200 with no record leaves the outcome unknown, so say so.
+
+        Reporting success here would have the caller believe a configuration
+        exists that it cannot reference; reporting plain failure would invite a
+        retry that could duplicate it. Both are wrong, so the response asks for
+        a re-read instead.
+        """
+        self.mock_client.command.return_value = _ok([], trace_id="tr-empty")
+
+        result = self.create_configuration()
+
+        self.assertIn("error", result)
+        self.assertIn("unclear whether the change was applied", result["error"])
+        self.assertEqual(result["details"]["trace_id"], "tr-empty")
+
+    def test_server_error_surfaces_status_and_trace(self):
+        """A 500 reports the status and keeps the trace id for support."""
+        self.mock_client.command.return_value = _err(
+            500, ["failed to save config"], trace_id="tr-500"
+        )
+
+        result = self.create_configuration()
+
+        self.assertIn("HTTP 500", result["error"])
+        self.assertEqual(result["details"]["trace_id"], "tr-500")
+
+    def test_body_includes_only_supplied_optionals(self):
+        """Unset optionals are omitted so defaults are not silently overwritten."""
+        self.mock_client.command.return_value = _ok([_existing_config()])
+
+        self.create_configuration(description="d", tag="t", is_default=False)
+
+        self.assertEqual(self.called_operation(), "PostConfigsV1")
+        body = self.called_kwargs()["body"]
+        self.assertEqual(body["name"], "Cloned Windows Triage")
+        self.assertEqual(body["platform"], "windows")
+        self.assertEqual(body["collections"], _WINDOWS_COLLECTIONS)
+        self.assertEqual(body["description"], "d")
+        self.assertEqual(body["tag"], "t")
+        self.assertIs(body["is_default"], False)
+        self.assertNotIn("id", body)
+
+
+class TestUpdateConfiguration(ForensicsTestCase):
+    """update_configuration: read-modify-write merging."""
+
+    def _read_then_write(self, existing=None, write=None):
+        """Queue the by-ID read followed by the write."""
+        self.mock_client.command.side_effect = [
+            _ok([existing or _existing_config()]),
+            write or _ok([_existing_config(name="Renamed")], trace_id="tr-update"),
+        ]
+
+    def test_omitted_fields_are_carried_over_from_the_existing_record(self):
+        """The API is a full overwrite, so omission must mean "keep", not "clear".
+
+        Sending only the changed field would blank everything else, so this
+        pins that every untouched value is read back and resent.
+        """
+        self._read_then_write()
+
+        result = self.update_configuration(name="Renamed")
+
+        self.assertEqual(result["configuration"]["name"], "Renamed")
+        self.assertEqual(self.called_operation(1), "PutConfigsV1")
+        self.assertEqual(
+            self.called_kwargs(1)["body"],
+            {
+                "name": "Renamed",
+                "platform": "windows",
+                "collections": _WINDOWS_COLLECTIONS,
+                "id": _CONFIG_ID,
+                "description": "original description",
+                "tag": "original-tag",
+                "is_default": True,
+            },
+        )
+
+    def test_collections_are_replaced_wholesale(self):
+        """A supplied collections array replaces, never merges with, the stored one."""
+        replacement = _WINDOWS_COLLECTIONS + [
+            {"name": "Event Logs", "collector": "evtx", "options": {}}
+        ]
+        self._read_then_write()
+
+        self.update_configuration(collections=replacement)
+
+        self.assertEqual(self.called_kwargs(1)["body"]["collections"], replacement)
+
+    def test_empty_string_clears_description(self):
+        """"" is a value, distinct from omission, so it reaches the API."""
+        self._read_then_write()
+
+        self.update_configuration(description="")
+
+        self.assertEqual(self.called_kwargs(1)["body"]["description"], "")
+
+    def test_empty_string_clears_tag(self):
+        """"" clears the tag rather than keeping the existing one."""
+        self._read_then_write()
+
+        self.update_configuration(tag="")
+
+        self.assertEqual(self.called_kwargs(1)["body"]["tag"], "")
+
+    def test_is_default_false_is_honored(self):
+        """False is a real value and must not be mistaken for "unset".
+
+        A truthiness check instead of an `is not None` check would silently
+        re-send the stored True and leave the configuration as the default.
+        """
+        self._read_then_write(existing=_existing_config(is_default=True))
+
+        self.update_configuration(is_default=False)
+
+        self.assertIs(self.called_kwargs(1)["body"]["is_default"], False)
+
+    def test_missing_config_id_makes_no_api_call(self):
+        """A blank id is rejected locally; the read is not attempted."""
+        result = self.update_configuration(config_id="")
+
+        self.assertIn("error", result)
+        self.mock_client.command.assert_not_called()
+
+    def test_unknown_config_id_does_not_attempt_a_write(self):
+        """If the read finds nothing, no write is issued with invented values."""
+        self.mock_client.command.return_value = _ok([])
+
+        result = self.update_configuration(name="Renamed")
+
+        self.assertIn("error", result)
+        self.assertIn("No configuration found", result["error"])
+        self.mock_client.command.assert_called_once()
+
+    def test_read_error_is_propagated_without_writing(self):
+        """A failed read aborts; writing after it would overwrite blind."""
+        self.mock_client.command.return_value = _err(403, ["access denied"])
+
+        self.assert_is_error(self.update_configuration(name="Renamed"))
+
+        self.mock_client.command.assert_called_once()
+
+    def test_templates_are_refused(self):
+        """Templates are shared reference material, so editing in place is refused.
+
+        The model guide tells callers to clone a template's collections; an
+        agent following that advice can easily target the template's own id.
+        Rewriting it would corrupt the source everyone else clones from, and
+        that damage is invisible until someone else's clone comes out wrong.
+        """
+        self.mock_client.command.return_value = _ok([_existing_config(is_template=True)])
+
+        result = self.update_configuration(name="Renamed")
+
+        self.assertIn("error", result)
+        self.assertIn("is a template", result["error"])
+        self.assertIn("create_configuration", result["error"])
+        self.mock_client.command.assert_called_once()
+
+    def test_platform_change_without_collections_is_refused(self):
+        """Collections are platform-specific, so the old ones cannot be carried over.
+
+        Letting this through would send windows collectors to a linux
+        configuration and fail server-side, or worse, persist a configuration
+        that collects nothing.
+        """
+        self.mock_client.command.return_value = _ok([_existing_config()])
+
+        result = self.update_configuration(platform="linux")
+
+        self.assertIn("error", result)
+        self.assertIn("without also supplying `collections`", result["error"])
+        self.mock_client.command.assert_called_once()
+
+    def test_platform_change_with_collections_is_allowed(self):
+        """Supplying matching collections makes a platform change legitimate."""
+        self._read_then_write()
+
+        self.update_configuration(platform="linux", collections=_LINUX_COLLECTIONS)
+
+        body = self.called_kwargs(1)["body"]
+        self.assertEqual(body["platform"], "linux")
+        self.assertEqual(body["collections"], _LINUX_COLLECTIONS)
+
+    def test_same_platform_restated_without_collections_is_allowed(self):
+        """Restating the current platform is a no-op, not a platform change."""
+        self._read_then_write()
+
+        self.update_configuration(platform="windows")
+
+        self.assertEqual(self.called_kwargs(1)["body"]["platform"], "windows")
+
+    def test_merged_values_are_revalidated(self):
+        """Validation runs on the merged document, not just the supplied fields."""
+        self.mock_client.command.return_value = _ok([_existing_config()])
+
+        result = self.update_configuration(name="x" * 2001)
+
+        self.assertIn("error", result)
+        self.mock_client.command.assert_called_once()
+
+    def test_duplicate_name_conflict_reports_no_change(self):
+        """A 409 on rename states nothing changed."""
+        self._read_then_write(write=_err(409, ["name already exists"]))
+
+        result = self.update_configuration(name="Windows Template")
+
+        self.assertIn("already exists", result["error"])
+        self.assertIn("Nothing was changed", result["error"])
+
+
+class TestCreateCollection(ForensicsTestCase):
+    """create_collection."""
+
+    def test_success_sends_the_expected_body(self):
+        """Targets and scheduling options are sent; unset optionals are omitted."""
+        self.mock_client.command.return_value = _ok([{"id": _COLLECTION_ID_A}])
+
+        self.create_collection(
+            aids=[_AID_A, _AID_B],
+            ffcids=[_FFCID_A],
+            collection_tag="ir-2026-10",
+            deadline="2026-11-03T18:00:00Z",
+            priority=9,
+            self_destruct=True,
+        )
+
+        self.assertEqual(self.called_operation(), "PostCollectionsV1")
+        self.assertEqual(
+            self.called_kwargs()["body"],
+            {
+                "aids": [_AID_A, _AID_B],
+                "ffcids": [_FFCID_A],
+                "config_id": _CONFIG_ID,
+                "priority": 9,
+                "deadline": "2026-11-03T18:00:00Z",
+                "collection_tag": "ir-2026-10",
+                "self_destruct": True,
+            },
+        )
+
+    def test_absent_target_lists_are_sent_as_empty_arrays(self):
+        """Omitted aids/ffcids become [] rather than null."""
+        self.mock_client.command.return_value = _ok([{"id": _COLLECTION_ID_A}])
+
+        self.create_collection(aids=None, ffcids=[_FFCID_A])
+
+        body = self.called_kwargs()["body"]
+        self.assertEqual(body["aids"], [])
+        self.assertEqual(body["ffcids"], [_FFCID_A])
+
+    def test_no_targets_makes_no_api_call(self):
+        """A run with no hosts is rejected locally."""
+        result = self.create_collection(aids=None, ffcids=None)
+
+        self.assertIn("error", result)
+        self.assertIn("At least one agent ID", result["error"])
+        self.mock_client.command.assert_not_called()
+
+    def test_empty_target_lists_make_no_api_call(self):
+        """Two empty lists are still no hosts."""
+        result = self.create_collection(aids=[], ffcids=[])
+
+        self.assertIn("error", result)
+        self.mock_client.command.assert_not_called()
+
+    def test_target_count_is_capped_across_both_lists(self):
+        """The cap applies to aids + ffcids combined, not each list separately."""
+        half = _MAX_COLLECTION_IDS // 2 + 1
+        result = self.create_collection(aids=[_AID_A] * half, ffcids=[_FFCID_A] * half)
+
+        self.assertIn("error", result)
+        self.assertIn(str(_MAX_COLLECTION_IDS), result["error"])
+        self.mock_client.command.assert_not_called()
+
+    def test_at_the_target_cap_is_allowed(self):
+        """Exactly the maximum is accepted; the check is inclusive."""
+        self.mock_client.command.return_value = _ok([{"id": _COLLECTION_ID_A}])
+
+        self.create_collection(aids=[_AID_A] * _MAX_COLLECTION_IDS)
+
+        self.mock_client.command.assert_called_once()
+
+    def test_platform_is_required_without_a_config_id(self):
+        """Falling back to the platform default needs a platform to pick it."""
+        result = self.create_collection(config_id=None, platform=None)
+
+        self.assertIn("error", result)
+        self.assertIn("`platform` is required", result["error"])
+        self.mock_client.command.assert_not_called()
+
+    def test_platform_alone_selects_the_default_configuration(self):
+        """With no config_id, platform is sent so the server picks the default."""
+        self.mock_client.command.return_value = _ok([{"id": _COLLECTION_ID_A}])
+
+        self.create_collection(config_id=None, platform="linux")
+
+        body = self.called_kwargs()["body"]
+        self.assertEqual(body["platform"], "linux")
+        self.assertNotIn("config_id", body)
+
+    def test_oversized_collection_tag_makes_no_api_call(self):
+        """A tag over the limit is caught locally."""
+        result = self.create_collection(
+            collection_tag="t" * (_MAX_COLLECTION_TAG_LENGTH + 1)
+        )
+
+        self.assertIn("error", result)
+        self.assertIn(str(_MAX_COLLECTION_TAG_LENGTH), result["error"])
+        self.mock_client.command.assert_not_called()
+
+    def test_api_error_is_surfaced(self):
+        """A rejected run surfaces the API message."""
+        self.mock_client.command.return_value = _err(400, ["no valid AIDs"])
+
+        self.assert_is_error(self.create_collection())
+
+
+class TestCancelCollections(ForensicsTestCase):
+    """cancel_collections."""
+
+    def test_success_reports_counts_and_records(self):
+        """Cancelled records and both counts come back for comparison."""
+        self.mock_client.command.return_value = _ok(
+            [{"id": _COLLECTION_ID_A, "state": "cancelling"}], trace_id="tr-cancel"
+        )
+
+        result = self.cancel_collections(ids=[_COLLECTION_ID_A])
+
+        self.assertEqual(result["cancelled_count"], 1)
+        self.assertEqual(result["requested_count"], 1)
+        self.assertEqual(result["collections"][0]["state"], "cancelling")
+        self.assertEqual(result["trace_id"], "tr-cancel")
+        self.assertNotIn("not_cancelled", result)
+
+    def test_ids_travel_as_a_query_parameter(self):
+        """The endpoint reads repeated ids= query params, not a body."""
+        self.mock_client.command.return_value = _ok([{"id": _COLLECTION_ID_A}])
+
+        self.cancel_collections(ids=[_COLLECTION_ID_A, _COLLECTION_ID_B])
+
+        self.assertEqual(self.called_operation(), "DeleteCollectionsV1")
+        self.assertEqual(
+            self.called_kwargs()["parameters"],
+            {"ids": [_COLLECTION_ID_A, _COLLECTION_ID_B]},
+        )
+        self.assertNotIn("body", self.called_kwargs())
+
+    def test_surrounding_whitespace_is_stripped(self):
+        """Copy-pasted ids with whitespace would otherwise fail to parse server-side."""
+        self.mock_client.command.return_value = _ok([{"id": _COLLECTION_ID_A}])
+
+        self.cancel_collections(ids=[f"  {_COLLECTION_ID_A} "])
+
+        self.assertEqual(
+            self.called_kwargs()["parameters"], {"ids": [_COLLECTION_ID_A]}
+        )
+
+    def test_partial_cancellation_is_flagged(self):
+        """IDs the server did not cancel are named, with the likely reason.
+
+        A partially-applied cancel returns 200, so without this diff a caller
+        would report every requested run as stopped while some kept collecting.
+        """
+        self.mock_client.command.return_value = _ok([{"id": _COLLECTION_ID_A}])
+
+        result = self.cancel_collections(ids=[_COLLECTION_ID_A, _COLLECTION_ID_B])
+
+        self.assertEqual(result["cancelled_count"], 1)
+        self.assertEqual(result["requested_count"], 2)
+        self.assertEqual(result["not_cancelled"], [_COLLECTION_ID_B])
+        self.assertIn("already complete", result["warning"])
+
+    def test_id_casing_does_not_produce_a_false_warning(self):
+        """Server ids are lowercase hex; an uppercase request must still match."""
+        self.mock_client.command.return_value = _ok([{"id": _COLLECTION_ID_A}])
+
+        result = self.cancel_collections(ids=[_COLLECTION_ID_A.upper()])
+
+        self.assertNotIn("not_cancelled", result)
+
+    def test_dashed_ids_are_compared_as_given(self):
+        """Matching is literal apart from case: a dashed id will not match.
+
+        The API returns dashless lowercase hex, so a dashed UUID is reported
+        under not_cancelled even though the server did cancel it. This is an
+        accepted limitation rather than a bug — the `ids` description tells
+        callers to pass ids through from search_collections unmodified, which
+        is the only documented source. This test exists so the behaviour is
+        recorded, and so a future decision to normalize is a deliberate change
+        to this assertion rather than a silent one.
+        """
+        dashed = "99998888-7777-6666-5555-444433332222"
+        self.mock_client.command.return_value = _ok([{"id": _COLLECTION_ID_A}])
+
+        result = self.cancel_collections(ids=[dashed])
+
+        self.assertEqual(result["not_cancelled"], [dashed])
+
+    def test_records_without_an_id_are_ignored_in_the_diff(self):
+        """A record missing `id` must not raise while computing the diff."""
+        self.mock_client.command.return_value = _ok([{"state": "cancelling"}])
+
+        result = self.cancel_collections(ids=[_COLLECTION_ID_A])
+
+        self.assertEqual(result["cancelled_count"], 0)
+        self.assertEqual(result["not_cancelled"], [_COLLECTION_ID_A])
+
+    def test_nothing_to_cancel_is_not_an_error(self):
+        """A 404 means the runs already finished; nothing changed.
+
+        Framing this as a failure invites a pointless retry. The message says
+        explicitly that no state changed and points at search_collections.
+        """
+        self.mock_client.command.return_value = _err(404, ["collection not found"])
+
+        result = self.cancel_collections()
+
+        self.assertNotIn("error", result)
+        self.assertTrue(result["no_collections_cancelled"])
+        self.assertEqual(result["cancelled_count"], 0)
+        self.assertIn("not an error", result["message"])
+
+    def test_no_ids_refuses_without_an_api_call(self):
+        """An empty id list is refused rather than sent as a broad cancel."""
+        result = self.cancel_collections(ids=[])
+
+        self.assertIn("error", result)
+        self.assertIn("search_collections", result["error"])
+        self.mock_client.command.assert_not_called()
+
+    def test_over_the_cancel_cap_makes_no_api_call(self):
+        """IDs ride in the URL, so the batch cap is enforced before sending.
+
+        Exceeding it server-side surfaces as an opaque 414 or, worse, a
+        truncated id list that cancels a silent subset.
+        """
+        result = self.cancel_collections(
+            ids=[_COLLECTION_ID_A] * (_MAX_CANCEL_COLLECTION_IDS + 1)
+        )
+
+        self.assertIn("error", result)
+        self.assertIn(str(_MAX_CANCEL_COLLECTION_IDS), result["error"])
+        self.assertIn("Split into batches", result["error"])
+        self.mock_client.command.assert_not_called()
+
+    def test_at_the_cancel_cap_is_allowed(self):
+        """Exactly the maximum is accepted."""
+        self.mock_client.command.return_value = _ok([])
+
+        self.cancel_collections(ids=[_COLLECTION_ID_A] * _MAX_CANCEL_COLLECTION_IDS)
+
+        self.mock_client.command.assert_called_once()
+
+    def test_total_failure_states_nothing_was_cancelled(self):
+        """With no records returned, the response says nothing was cancelled."""
+        self.mock_client.command.return_value = _err(500, ["failed to cancel"])
+
+        result = self.cancel_collections()
+
+        self.assertIn("No collections were cancelled", result["error"])
+        self.assertEqual(result["details"]["trace_id"], "trace-1")
+
+    def test_partial_failure_is_distinguished_from_total_failure(self):
+        """When some records came back, the wording must not claim nothing happened."""
+        self.mock_client.command.return_value = _err(
+            500, ["partial failure"], resources=[{"id": _COLLECTION_ID_A}]
+        )
+
+        result = self.cancel_collections()
+
+        self.assertIn("partially failed", result["error"])
+        self.assertEqual(len(result["details"]["collections"]), 1)
+
+
+class TestDeployCollectors(ForensicsTestCase):
+    """deploy_collectors."""
+
+    def test_success_reports_counts_and_collectors(self):
+        """Deployed collectors and both counts come back for comparison."""
+        self.mock_client.command.return_value = _ok(
+            [{"aid": _AID_A, "ffcid": _FFCID_A, "state": "deploying"}],
+            trace_id="tr-deploy",
+        )
+
+        result = self.deploy_collectors(aids=[_AID_A])
+
+        self.assertEqual(result["deployed_count"], 1)
+        self.assertEqual(result["requested_count"], 1)
+        self.assertEqual(result["collectors"][0]["ffcid"], _FFCID_A)
+        self.assertEqual(result["trace_id"], "tr-deploy")
+        self.assertNotIn("not_deployed", result)
+
+    def test_body_shape_and_whitespace_stripping(self):
+        """queue_offline is always sent; aids are stripped."""
+        self.mock_client.command.return_value = _ok([{"aid": _AID_A}])
+
+        self.deploy_collectors(aids=[f" {_AID_A} ", _AID_B], queue_offline=True)
+
+        self.assertEqual(self.called_operation(), "PostDeployV1")
+        self.assertEqual(
+            self.called_kwargs()["body"],
+            {"aids": [_AID_A, _AID_B], "queue_offline": True},
+        )
+
+    def test_silently_skipped_hosts_are_flagged(self):
+        """Hosts the API omitted are named rather than assumed deployed.
+
+        The endpoint returns 200 and simply leaves out hosts that already have
+        a session or are unknown, so only a diff against the request reveals
+        that a host was never touched.
+        """
+        self.mock_client.command.return_value = _ok([{"aid": _AID_A}])
+
+        result = self.deploy_collectors(aids=[_AID_A, _AID_B])
+
+        self.assertEqual(result["deployed_count"], 1)
+        self.assertEqual(result["not_deployed"], [_AID_B])
+        self.assertIn("already online or deploying", result["warning"])
+
+    def test_aid_casing_does_not_produce_a_false_warning(self):
+        """An uppercase request still matches the lowercase AID returned."""
+        self.mock_client.command.return_value = _ok([{"aid": _AID_A}])
+
+        result = self.deploy_collectors(aids=[_AID_A.upper()])
+
+        self.assertNotIn("not_deployed", result)
+
+    def test_no_aids_makes_no_api_call(self):
+        """An empty aid list is refused locally."""
+        result = self.deploy_collectors(aids=[])
+
+        self.assertIn("error", result)
+        self.mock_client.command.assert_not_called()
+
+    def test_over_the_aid_cap_makes_no_api_call(self):
+        """Oversized batches are rejected with a batching instruction."""
+        result = self.deploy_collectors(
+            aids=[_AID_A] * (_MAX_DEPLOY_OR_SHUTDOWN_AIDS + 1)
+        )
+
+        self.assertIn("error", result)
+        self.assertIn("Split into batches", result["error"])
+        self.mock_client.command.assert_not_called()
+
+    def test_proxy_settings_are_all_or_nothing(self):
+        """Half-specified or contradictory proxy settings are refused locally.
+
+        A partial proxy spec is accepted by the endpoint and then quietly
+        ignored, so the collector deploys with the wrong network path and the
+        caller never learns why it cannot phone home.
+        """
+        cases = {
+            "no_proxy with host": {"no_proxy": True, "proxy_host": "p.example.test"},
+            "no_proxy with port": {"no_proxy": True, "proxy_port": 8080},
+            "host without port": {"proxy_host": "p.example.test"},
+            "port without host": {"proxy_port": 8080},
+        }
+        for label, overrides in cases.items():
+            with self.subTest(case=label):
+                self.mock_client.command.reset_mock()
+                result = self.deploy_collectors(**overrides)
+                self.assertIn("error", result)
+                self.mock_client.command.assert_not_called()
+
+    def test_complete_proxy_settings_are_forwarded(self):
+        """Host and port together are valid and reach the API."""
+        self.mock_client.command.return_value = _ok([{"aid": _AID_A}])
+
+        self.deploy_collectors(proxy_host="p.example.test", proxy_port=8080)
+
+        body = self.called_kwargs()["body"]
+        self.assertEqual(body["proxy_host"], "p.example.test")
+        self.assertEqual(body["proxy_port"], 8080)
+        self.assertNotIn("no_proxy", body)
+
+    def test_no_proxy_is_sent_only_when_true(self):
+        """no_proxy=False is omitted so it is not read as an explicit opt-out."""
+        self.mock_client.command.return_value = _ok([{"aid": _AID_A}])
+
+        self.deploy_collectors(no_proxy=True)
+        self.assertIs(self.called_kwargs()["body"]["no_proxy"], True)
+
+        self.mock_client.command.reset_mock()
+        self.mock_client.command.return_value = _ok([{"aid": _AID_A}])
+        self.deploy_collectors(no_proxy=False)
+        self.assertNotIn("no_proxy", self.called_kwargs()["body"])
+
+    def test_out_of_range_proxy_port_makes_no_api_call(self):
+        """A port outside 1-65535 is rejected locally."""
+        for port in (0, 70000):
+            with self.subTest(port=port):
+                self.mock_client.command.reset_mock()
+                result = self.deploy_collectors(
+                    proxy_host="p.example.test", proxy_port=port
+                )
+                self.assertIn("error", result)
+                self.mock_client.command.assert_not_called()
+
+    def test_unknown_aids_404_states_nothing_deployed(self):
+        """A 404 reports that no collectors were deployed."""
+        self.mock_client.command.return_value = _err(404, ["aid not found"])
+
+        result = self.deploy_collectors()
+
+        self.assertIn("No collectors were deployed", result["error"])
+
+    def test_partial_failure_is_distinguished_from_total_failure(self):
+        """With some collectors returned, the wording reflects partial progress."""
+        self.mock_client.command.return_value = _err(
+            500, ["failed to deploy"], resources=[{"aid": _AID_A}]
+        )
+
+        result = self.deploy_collectors(aids=[_AID_A, _AID_B])
+
+        self.assertIn("partially failed", result["error"])
+        self.assertEqual(len(result["details"]["collectors"]), 1)
+
+
+class TestShutdownCollectors(ForensicsTestCase):
+    """shutdown_collectors."""
+
+    def test_success_echoes_self_destruct(self):
+        """The response records whether the binary was also removed.
+
+        self_destruct is not reversible from here — redeploying needs a fresh
+        deploy call — so the caller needs it stated in the result, not just in
+        the request it sent.
+        """
+        self.mock_client.command.return_value = _ok(
+            [{"aid": _AID_A, "ffcid": _FFCID_A}], trace_id="tr-shutdown"
+        )
+
+        result = self.shutdown_collectors(self_destruct=True)
+
+        self.assertEqual(result["shutdown_count"], 1)
+        self.assertIs(result["self_destruct"], True)
+        self.assertEqual(result["trace_id"], "tr-shutdown")
+        self.assertNotIn("not_shutdown", result)
+
+    def test_body_always_sends_both_target_lists_and_both_flags(self):
+        """Absent lists become []; flags are sent explicitly."""
+        self.mock_client.command.return_value = _ok([{"aid": _AID_A}])
+
+        self.shutdown_collectors(
+            aids=[f" {_AID_A} "], ffcids=[f" {_FFCID_A} "], self_destruct=True, force=True
+        )
+
+        self.assertEqual(self.called_operation(), "PostCollectorsV1")
+        self.assertEqual(
+            self.called_kwargs()["body"],
+            {
+                "aids": [_AID_A],
+                "ffcids": [_FFCID_A],
+                "self_destruct": True,
+                "force": True,
+            },
+        )
+
+    def test_ffcid_only_request_is_allowed(self):
+        """Targeting a specific collector instance by ffcid alone is valid."""
+        self.mock_client.command.return_value = _ok([{"ffcid": _FFCID_A}])
+
+        result = self.shutdown_collectors(aids=None, ffcids=[_FFCID_A])
+
+        self.assertEqual(self.called_kwargs()["body"]["aids"], [])
+        self.assertNotIn("not_shutdown", result)
+
+    def test_targets_are_matched_on_either_identifier(self):
+        """A record matches whether it reports the aid or the ffcid.
+
+        Resources carry both fields, so matching only one would report a
+        successfully stopped collector as missed.
+        """
+        self.mock_client.command.return_value = _ok(
+            [{"aid": _AID_A, "ffcid": None}, {"aid": None, "ffcid": _FFCID_A}]
+        )
+
+        result = self.shutdown_collectors(aids=[_AID_A], ffcids=[_FFCID_A])
+
+        self.assertNotIn("not_shutdown", result)
+
+    def test_unmatched_targets_are_flagged(self):
+        """Targets with nothing running are named rather than reported as stopped."""
+        self.mock_client.command.return_value = _ok([{"aid": _AID_A}])
+
+        result = self.shutdown_collectors(aids=[_AID_A, _AID_B])
+
+        self.assertEqual(result["not_shutdown"], [_AID_B])
+        self.assertIn("search_collectors", result["warning"])
+
+    def test_no_targets_refuses_without_an_api_call(self):
+        """An untargeted shutdown is refused; it would be a fleet-wide action.
+
+        Falling through with empty lists risks the endpoint interpreting the
+        request as "all collectors for this CID", which cannot be undone.
+        """
+        result = self.shutdown_collectors(aids=None, ffcids=None)
+
+        self.assertIn("error", result)
+        self.assertIn("Refusing to shut down", result["error"])
+        self.mock_client.command.assert_not_called()
+
+    def test_empty_target_lists_refuse_without_an_api_call(self):
+        """Two empty lists are still no targets."""
+        result = self.shutdown_collectors(aids=[], ffcids=[])
+
+        self.assertIn("error", result)
+        self.mock_client.command.assert_not_called()
+
+    def test_target_count_is_capped_across_both_lists(self):
+        """The cap applies to aids + ffcids combined."""
+        half = _MAX_DEPLOY_OR_SHUTDOWN_AIDS // 2 + 1
+        result = self.shutdown_collectors(
+            aids=[_AID_A] * half, ffcids=[_FFCID_A] * half
+        )
+
+        self.assertIn("error", result)
+        self.assertIn("Split into batches", result["error"])
+        self.mock_client.command.assert_not_called()
+
+    def test_nothing_running_is_not_an_error_and_not_a_force_prompt(self):
+        """A 404 means nothing was running; it must not suggest retrying with force.
+
+        force can abandon an in-progress collection and lose its data, so a
+        benign "nothing to stop" result explicitly steers away from it.
+        """
+        self.mock_client.command.return_value = _err(404, ["no in progress collectors"])
+
+        result = self.shutdown_collectors()
+
+        self.assertNotIn("error", result)
+        self.assertTrue(result["no_collectors_in_progress"])
+        self.assertEqual(result["shutdown_count"], 0)
+        self.assertIn("Do not retry with force=true", result["message"])
+
+    def test_total_failure_surfaces_status_and_trace(self):
+        """A 500 with no records reports plain failure."""
+        self.mock_client.command.return_value = _err(500, ["failed to shutdown"])
+
+        result = self.shutdown_collectors()
+
+        self.assertIn("Shutdown failed (HTTP 500)", result["error"])
+        self.assertEqual(result["details"]["trace_id"], "trace-1")
+
+    def test_partial_failure_is_distinguished(self):
+        """With some records returned, the wording reflects partial progress."""
+        self.mock_client.command.return_value = _err(
+            500, ["partial"], resources=[{"aid": _AID_A}]
+        )
+
+        result = self.shutdown_collectors(aids=[_AID_A, _AID_B])
+
+        self.assertIn("partially failed", result["error"])
 
 
 if __name__ == "__main__":

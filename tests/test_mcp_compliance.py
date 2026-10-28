@@ -98,6 +98,7 @@ MUTATING_TOOL_ALLOWLIST: set[str] = {
     "falcon_create_configuration",
     "falcon_update_configuration",
     "falcon_create_collection",
+    "falcon_cancel_collections",
     "falcon_deploy_collectors",
     "falcon_shutdown_collectors"
 }

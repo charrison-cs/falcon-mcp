@@ -23,6 +23,7 @@ from falcon_mcp.resources.forensics import (
 
 logger = get_logger(__name__)
 _MAX_COLLECTION_IDS = 5000 # max ffcids + aids allowed for one collection request
+_MAX_CANCEL_COLLECTION_IDS = 200 # max collection IDs to cancel at a time. Collection IDs are query param
 _MAX_COLLECTION_TAG_LENGTH = 100 # max length of collection tag
 _MAX_DEPLOY_OR_SHUTDOWN_AIDS = 10000  # max number of aids to deploy or shutdown to in a single request
 
@@ -46,18 +47,6 @@ class ForensicsModule(BaseModule):
             server=server,
             method=self.search_collectors,
             name="search_collectors",
-        )
-
-        self._add_tool(
-            server=server,
-            method=self.search_collections_by_ids,
-            name="search_collections_by_ids",
-        )
-
-        self._add_tool(
-            server=server,
-            method=self.search_collectors_by_ids,
-            name="search_collectors_by_ids",
         )
 
         self._add_tool(
@@ -108,6 +97,18 @@ class ForensicsModule(BaseModule):
                 openWorldHint=False,
             ),
         )
+     
+        self._add_tool(
+            server=server,
+            method=self.cancel_collections,
+            name="cancel_collections",
+            annotations=ToolAnnotations(
+                readOnlyHint=False,
+                destructiveHint=True,
+                idempotentHint=True,
+                openWorldHint=False,
+            ),
+        )   
 
         self._add_tool(
             server=server,
@@ -218,7 +219,7 @@ class ForensicsModule(BaseModule):
             description="The offset to start retrieving records from.",
         ),
         sort: str = Field(
-            default="last_modified_timestamp.desc",
+            default="modified_timestamp.desc",
             description=dedent("""
                 Sort collections using these options:
 
@@ -232,9 +233,9 @@ class ForensicsModule(BaseModule):
                 Each was verified to reorder results. Sort either asc (ascending)
                 or desc (descending), using the dot separator ('name.desc').
 
-                Examples: 'last_modified_timestamp.desc', 'priority.desc'
+                Examples: 'modified_timestamp.desc', 'priority.desc'
             """).strip(),
-            examples=["last_modified_timestamp.desc", "collection_tag.asc"],
+            examples=["modified_timestamp.desc", "collection_tag.asc"],
         ),
     ) -> list[dict[str, Any]] | dict[str, Any]:
         """Search for Falcon Forensics Collections in your CrowdStrike environment.
@@ -271,40 +272,40 @@ class ForensicsModule(BaseModule):
                                 "for syntax.",
                 examples=["filter=platform:'windows'", "state:'online'", "aid:'foo'", "ffcid:'bar'"],
             ),
-            limit: int = Field(
+            limit: int | None = Field(
                         default=10,
                         ge=1,
                         le=500,
                         description="The maximum records to return. [1-500]",
-                    ),
-                    offset: int | None = Field(
-                        default=None,
-                        description="The offset to start retrieving records from.",
-                    ),
-                    sort: str = Field(
-                        default="seen_timestamp.desc",
-                        description=dedent("""
-                            Sort definitions using these options:
-            
-                            aid: the falcon sensor agent ID associated with the forensics collector
-                            ffcid: the forensics collection unique identifier
-                            state: the state the collector is in, e.g. offline, online, error
-                            platform: platform of collector host, e.g. windows, linux, mac
-                            modified_timestamp: the last modified time of a collector
-                            seen_timestamp: the last time the collector was seen online
-            
-                            Each was verified to reorder results. Sort either asc (ascending)
-                            or desc (descending), using the dot separator ('name.desc').
-            
-                            Examples: 'timestamp.desc', 'state.asc'
-                        """).strip(),
-                        examples={"last_modified_timestamp.desc", "platform.asc"},
+            ),
+            offset: int | None = Field(
+                default=None,
+                description="The offset to start retrieving records from.",
+            ),
+            sort: str | None = Field(
+                default="seen_timestamp.desc",
+                description=dedent("""
+                    Sort definitions using these options:
+    
+                    aid: the falcon sensor agent ID associated with the forensics collector
+                    ffcid: the forensics collection unique identifier
+                    state: the state the collector is in, e.g. offline, online, error
+                    platform: platform of collector host, e.g. windows, linux, mac
+                    modified_timestamp: the last modified time of a collector
+                    seen_timestamp: the last time the collector was seen online
+    
+                    Each was verified to reorder results. Sort either asc (ascending)
+                    or desc (descending), using the dot separator ('name.desc').
+    
+                    Examples: 'timestamp.desc', 'state.asc'
+                """).strip(),
+                examples=["seen_timestamp.desc", "platform.asc"],
                     ),
         ) -> list[dict[str, Any]] | dict[str, Any]:
-            """Search for Falcon Forensics Collections in your CrowdStrike environment.
+            """Search for Falcon Forensics Collectors in your CrowdStrike environment.
     
-            Use this to find a collection to inspect, filtering on platform, state
-            ffcid, aid, priority, collection tag, config_id or session_id. Consult
+            Use this to find a collector to inspect, filtering on platform, state
+            ffcid, aid, seen_timestamp or session_id. Consult
             falcon://forensics/collectors/fql-guide before constructing filter
             expressions
             """
@@ -326,64 +327,6 @@ class ForensicsModule(BaseModule):
     
             return self._build_pagination_envelope(collections or [], pagination, filter)
 
-    def search_collections_by_ids(
-        self,
-        ids: list[str] = Field(
-                    description="Collector IDs to retrieve details for."
-            ),
-    ) -> list[dict[str, Any]]:
-        """Search for Forensics Collectors in your CrowdStrike environment.
-
-        Use this to find collections by collection IDs. Consult falcon://forensics/collectors/fql-guide before constructing filter expressions. Returns full collection details including session ID, 
-        aid, ffcid, platform, state, last seen.
-        """
-
-        # If we have collection IDs, get the details for each one
-        if ids:
-            details = self._base_get_by_ids(
-                operation="GetCollectionsV1",
-                ids=ids,
-                id_key="ids",
-            )
-
-            # If handle_api_response returns an error dict instead of a list,
-            # it means there was an error, so we return it wrapped in a list
-            if self._is_error(details):
-                return [details]
-
-            return details
-
-        return []
-
-    def search_collectors_by_ids(
-            self,
-            ids: list[str] = Field(
-                        description="collector IDs to retrieve details for."
-                ),
-        ) -> list[dict[str, Any]]:
-            """Search for Forensics Collections in your CrowdStrike environment.
-    
-            Use this to find collectors by collector IDs. Consult falcon://forensics/collectors/fql-guide before constructing filter
-            expressions. Returns full collector details including, aid, ffcid, state, last seen, last modified.
-            """
-    
-            # If we have collection IDs, get the details for each one
-            if ids:
-                details = self._base_get_by_ids(
-                    operation="GetCollectorsV1",
-                    ids=ids,
-                    id_key="ids",
-                )
-    
-                # If handle_api_response returns an error dict instead of a list,
-                # it means there was an error, so we return it wrapped in a list
-                if self._is_error(details):
-                    return [details]
-    
-                return details
-    
-            return []
-
     def search_configurations_and_templates(
         self,
         filter: str | None = Field(
@@ -391,7 +334,7 @@ class ForensicsModule(BaseModule):
                             "for syntax.",
             examples=["filter=platform:'windows'", "name:'DeepWindowsScan'", "description:*'*Registry*'"],
         ),
-        limit: int = Field(
+        limit: int | None = Field(
                     default=10,
                     ge=1,
                     le=500,
@@ -401,8 +344,8 @@ class ForensicsModule(BaseModule):
                     default=None,
                     description="The offset to start retrieving records from.",
                 ),
-                sort: str = Field(
-                    default="last_modified_timestamp.desc",
+                sort: str | None = Field(
+                    default="modified_timestamp.desc",
                     description=dedent("""
                         Sort definitions using these options:
         
@@ -414,9 +357,9 @@ class ForensicsModule(BaseModule):
                         Each was verified to reorder results. Sort either asc (ascending)
                         or desc (descending), using the dot separator ('name.desc').
         
-                        Examples: 'modified_timestamp.desc', 'name.asc'
+                        Examples: 'modified_timestamp.desc', 'name.asc', 'is_template.asc'
                     """).strip(),
-                    examples={"modified_timestamp.desc", "name.asc"},
+                    examples=["modified_timestamp.desc", "name.asc", "is_template.asc"],
                 ),
     ) -> list[dict[str, Any]] | dict[str, Any]:
         """Search for Falcon Forensics Configurations in your CrowdStrike environment.
@@ -537,7 +480,7 @@ class ForensicsModule(BaseModule):
         if is_default is not None:
             body["is_default"] = is_default
 
-        response = self.client.command("ValidateConfigV1", body=body)
+        response = self.client.command("PostConfigsV1", body=body)
         return _classify_save_response(response, action="create")
 
     def validate_configuration(
@@ -854,12 +797,53 @@ class ForensicsModule(BaseModule):
         if self_destruct is not None:
             body["self_destruct"] = self_destruct
 
-        return self._base_create(
-            operation="PostCollectionsV1",
-            body=body,
-            error_message="Failed to create collection",
+        requested_count = len(aids or []) + len(ffcids or [])
+        response = self.client.command("PostCollectionsV1", body=body)
+        return _classify_create_collection_response(
+            response, requested_count=requested_count
         )
 
+    def cancel_collections(
+        self,
+        ids: list[str] = Field(
+            description=(
+                "Collection IDs to cancel. 32-character hex strings obtained from `search_collections` — never guess them. "
+                "Every ID must be well-formed: a single malformed ID rejects the "
+                f"whole request and cancels nothing. Maximum {_MAX_CANCEL_COLLECTION_IDS} "
+                "per call."
+            ),
+            examples=[["1234567890abcdef1234567890abcdef"]],
+            max_length=_MAX_CANCEL_COLLECTION_IDS,
+        ),
+    ) -> dict[str, Any]:
+        """Cancel in-progress Falcon Forensics collection runs.
+
+        This stops scheduled and running collections on live endpoints, so data
+        those hosts had not yet uploaded is not collected. Resolve the exact
+        collection IDs with `search_collections` first and confirm they are the
+        intended runs before calling.
+
+        Only collections in an active state are cancelled — ones already
+        complete, failed, or already cancelling are left untouched. Cancelling a
+        collection does not shut down or remove the collector on the host; use
+        `shutdown_collectors` for that.
+
+        Returns the collections that were actually cancelled. Compare that list
+        against the IDs you requested: IDs that were already in a terminal state
+        are reported in `not_cancelled` (partial success), so always inspect the
+        response rather than assuming every requested run stopped.
+        """
+        error = _validate_cancel_collections_request(ids)
+        if error:
+            return error
+
+        cleaned = [i.strip() for i in ids]
+        response = self.client.command(
+            "DeleteCollectionsV1",
+            parameters={"ids": cleaned},
+        )
+        return _classify_cancel_response(response, requested=cleaned)
+    
     def deploy_collectors(
         self,
         aids: list[str] = Field(
@@ -909,7 +893,7 @@ class ForensicsModule(BaseModule):
         or set no_proxy=true, or omit all three for default behaviour.
 
         Returns the collectors that were actually deployed. Compare that list
-        against the AIDs you requested — hosts can be silently omitted if they are
+        against the AIDs you requested — hosts can be silently omitted if they
         already have an active collector session, are already in a deploying state or
         are unknown aids.
         """
@@ -1310,5 +1294,148 @@ def _classify_save_response(
 
     return _format_error_response(
         f"Failed to {action} configuration (HTTP {status}).",
+        details={"errors": errors, "trace_id": trace_id},
+    )
+    
+def _validate_cancel_collections_request(ids: list[str]) -> dict[str, Any] | None:
+    if not ids:
+        return _format_error_response(
+            "Refusing to cancel collections: no 'ids' supplied. Look up the "
+            "specific collection runs with search_collections and pass them "
+            "explicitly."
+        )
+    if len(ids) > _MAX_CANCEL_COLLECTION_IDS:
+        return _format_error_response(
+            f"Too many collection IDs: {len(ids)} supplied, maximum is "
+            f"{_MAX_CANCEL_COLLECTION_IDS}. Split into batches."
+        )
+
+    return None
+
+def _classify_cancel_response(
+    response: dict[str, Any], requested: list[str]
+) -> dict[str, Any]:
+    status = response.get("status_code")
+    body = response.get("body") or {}
+    errors = body.get("errors") or []
+    resources = body.get("resources") or []
+    trace_id = (body.get("meta") or {}).get("trace_id")
+
+    if status == 200 and not errors:
+        cancelled = {r["id"].lower() for r in resources if r.get("id")}
+        missing = [i for i in requested if i.lower() not in cancelled]
+        result: dict[str, Any] = {
+            "cancelled_count": len(cancelled),
+            "requested_count": len(requested),
+            "collections": resources,
+            "trace_id": trace_id,
+        }
+        if missing:
+            result["not_cancelled"] = missing
+            result["warning"] = (
+                f"{len(missing)} of {len(requested)} requested collections were "
+                f"not cancelled. Likely already complete, failed, or already "
+                f"cancelling — only active collections can be cancelled. Check "
+                f"their current state with search_collections before retrying."
+            )
+        return result
+
+    # 404 = no collection matched the IDs, or none were in a cancellable state.
+    # Nothing was running to stop and no state changed.
+    if status == 404:
+        return {
+            "cancelled_count": 0,
+            "collections": [],
+            "no_collections_cancelled": True,
+            "message": (
+                "No matching active collections were found, so nothing was "
+                "cancelled and no state changed. This is not an error — the runs "
+                "may have already finished. Verify with search_collections "
+                "instead of retrying."
+            ),
+            "trace_id": trace_id,
+        }
+
+    return _format_error_response(
+        f"Cancellation failed (HTTP {status}). No collections were cancelled."
+        if not resources
+        else f"Cancellation partially failed (HTTP {status}).",
+        details={"errors": errors, "collections": resources, "trace_id": trace_id},
+    )
+    
+def _classify_create_collection_response(
+    response: dict[str, Any], requested_count: int
+) -> dict[str, Any]:
+    """Classify a create_collections (POST) response.
+
+    Unlike the other classifiers here, a 200 is NOT required to have an empty
+    `errors` array. The handler appends per-host platform-compatibility errors
+    before deciding whether to continue, and only aborts when no host matched
+    at all. So a populated `errors` array on a 200 means "scheduled on the rest"
+    — a real run is live, and reporting it as a failure would invite a retry
+    that double-schedules the hosts that did match.
+
+    Resources are only populated on the final success path, so any non-200
+    means nothing was scheduled.
+    """
+    status = response.get("status_code")
+    body = response.get("body") or {}
+    errors = body.get("errors") or []
+    resources = body.get("resources") or []
+    trace_id = (body.get("meta") or {}).get("trace_id")
+
+    if status == 200 and resources:
+        result: dict[str, Any] = {
+            "scheduled_count": len(resources),
+            "requested_count": requested_count,
+            "collections": resources,
+            "trace_id": trace_id,
+        }
+        if errors:
+            result["partial_success"] = True
+            result["errors"] = errors
+            result["warning"] = (
+                f"{len(errors)} target(s) were rejected; the collection is "
+                f"scheduled and running on the remaining hosts. Usually a host "
+                f"platform that does not match the configuration's platform. "
+                f"Read `errors` for the specific hosts, and do NOT re-run the "
+                f"whole request — that would schedule a second collection on "
+                f"the hosts that succeeded."
+            )
+        elif len(resources) < requested_count:
+            result["warning"] = (
+                f"Only {len(resources)} of {requested_count} requested targets "
+                f"produced a collection, with no errors reported. Verify the "
+                f"missing hosts with search_collections before re-running."
+            )
+        return result
+
+    if status == 200:
+        return _format_error_response(
+            "The request succeeded but scheduled no collections, so there is no "
+            "run to track. Verify the target hosts exist and match the "
+            "configuration's platform.",
+            details={"errors": errors, "trace_id": trace_id},
+        )
+
+    if status == 404:
+        return _format_error_response(
+            "The configuration was not found; nothing was scheduled. Look up a "
+            "valid config_id with search_configurations_and_templates, or omit "
+            "config_id and pass `platform` to use the platform default.",
+            details={"errors": errors, "trace_id": trace_id},
+        )
+
+    if status == 400:
+        return _format_error_response(
+            "The collection request was rejected and nothing was scheduled. "
+            "Either the request itself was invalid, or every target was "
+            "rejected because no host platform matched the configuration's "
+            "platform. Read `errors` — it names the specific problem.",
+            details={"errors": errors, "trace_id": trace_id},
+        )
+
+    return _format_error_response(
+        f"Failed to create collection (HTTP {status}). No collection was scheduled.",
         details={"errors": errors, "trace_id": trace_id},
     )
